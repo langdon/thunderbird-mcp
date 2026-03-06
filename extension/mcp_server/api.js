@@ -584,6 +584,85 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             }
 
+            function stripHtml(html) {
+              if (!html) return "";
+              let text = String(html);
+
+              // Remove style/script blocks
+              text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ");
+              text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ");
+
+              // Convert block-level tags to newlines before stripping
+              text = text.replace(/<br\s*\/?>/gi, "\n");
+              text = text.replace(/<\/(p|div|li|tr|h[1-6]|blockquote|pre)>/gi, "\n");
+              text = text.replace(/<(p|div|li|tr|h[1-6]|blockquote|pre)\b[^>]*>/gi, "\n");
+
+              // Strip remaining tags
+              text = text.replace(/<[^>]+>/g, " ");
+
+              // Decode entities in a single pass
+              const NAMED_ENTITIES = {
+                nbsp: " ",
+                amp: "&",
+                lt: "<",
+                gt: ">",
+                quot: "\"",
+                apos: "'",
+                "#39": "'",
+              };
+              text = text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/gi, (match, entity) => {
+                if (entity.startsWith("#x") || entity.startsWith("#X")) {
+                  const cp = parseInt(entity.slice(2), 16);
+                  return cp ? String.fromCodePoint(cp) : match;
+                }
+                if (entity.startsWith("#")) {
+                  const cp = parseInt(entity.slice(1), 10);
+                  return cp ? String.fromCodePoint(cp) : match;
+                }
+                return NAMED_ENTITIES[entity.toLowerCase()] || match;
+              });
+
+              // Normalize newlines/spaces
+              text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+              text = text.replace(/\n{3,}/g, "\n\n");
+              text = text.replace(/[ \t\f\v]+/g, " ");
+              text = text.replace(/ *\n */g, "\n");
+              text = text.trim();
+              return text;
+            }
+
+            /**
+             * Extracts plain text body from a MIME message.
+             * Tries coerceBodyToPlaintext first, then walks MIME tree for HTML fallback.
+             */
+            function extractPlainTextBody(aMimeMsg) {
+              if (!aMimeMsg) return "";
+              try {
+                const text = aMimeMsg.coerceBodyToPlaintext();
+                if (text) return text;
+              } catch { /* fall through */ }
+              try {
+                function findBody(part) {
+                  const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
+                  if (ct === "text/plain" && part.body) return { text: part.body, isHtml: false };
+                  if (ct === "text/html" && part.body) return { text: part.body, isHtml: true };
+                  if (part.parts) {
+                    let htmlFallback = null;
+                    for (const sub of part.parts) {
+                      const r = findBody(sub);
+                      if (r && !r.isHtml) return r;
+                      if (r && r.isHtml && !htmlFallback) htmlFallback = r;
+                    }
+                    if (htmlFallback) return htmlFallback;
+                  }
+                  return null;
+                }
+                const found = findBody(aMimeMsg);
+                if (found) return found.isHtml ? stripHtml(found.text) : found.text;
+              } catch { /* give up */ }
+              return "";
+            }
+
             /**
              * Converts body text to HTML for compose fields.
              * Handles both HTML input (entity-encodes non-ASCII) and plain text.
@@ -994,100 +1073,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return;
                     }
 
-                    let body = "";
+                    let body = extractPlainTextBody(aMimeMsg);
                     let bodyIsHtml = false;
-                    try {
-                      body = aMimeMsg.coerceBodyToPlaintext();
-                    } catch {
-                      body = "";
-                    }
-
-                    // If plain text extraction failed, try to get HTML body from MIME parts
-                    if (!body) {
-                      try {
-                        function stripHtml(html) {
-                          if (!html) return "";
-                          let text = String(html);
-
-                          // Remove style/script blocks
-                          text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ");
-                          text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ");
-
-                          // Convert block-level tags to newlines before stripping
-                          text = text.replace(/<br\s*\/?>/gi, "\n");
-                          text = text.replace(/<\/(p|div|li|tr|h[1-6]|blockquote|pre)>/gi, "\n");
-                          text = text.replace(/<(p|div|li|tr|h[1-6]|blockquote|pre)\b[^>]*>/gi, "\n");
-
-                          // Strip remaining tags
-                          text = text.replace(/<[^>]+>/g, " ");
-
-                          // Decode entities in a single pass
-                          const NAMED_ENTITIES = {
-                            nbsp: " ",
-                            amp: "&",
-                            lt: "<",
-                            gt: ">",
-                            quot: "\"",
-                            apos: "'",
-                            "#39": "'",
-                          };
-                          text = text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/gi, (match, entity) => {
-                            if (entity.startsWith("#x") || entity.startsWith("#X")) {
-                              const cp = parseInt(entity.slice(2), 16);
-                              return cp ? String.fromCodePoint(cp) : match;
-                            }
-                            if (entity.startsWith("#")) {
-                              const cp = parseInt(entity.slice(1), 10);
-                              return cp ? String.fromCodePoint(cp) : match;
-                            }
-                            return NAMED_ENTITIES[entity.toLowerCase()] || match;
-                          });
-
-                          // Normalize newlines/spaces
-                          text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-                          text = text.replace(/\n{3,}/g, "\n\n");
-                          text = text.replace(/[ \t\f\v]+/g, " ");
-                          text = text.replace(/ *\n */g, "\n");
-                          text = text.trim();
-                          return text;
-                        }
-
-                        function findBody(part) {
-                          const contentType = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
-                          if (contentType === "text/plain" && part.body) {
-                            return { text: part.body, isHtml: false };
-                          }
-                          if (contentType === "text/html" && part.body) {
-                            return { text: part.body, isHtml: true };
-                          }
-                          if (part.parts) {
-                            let htmlFallback = null;
-                            for (const sub of part.parts) {
-                              const result = findBody(sub);
-                              if (result && !result.isHtml) return result;
-                              if (result && result.isHtml && !htmlFallback) htmlFallback = result;
-                            }
-                            if (htmlFallback) return htmlFallback;
-                          }
-                          return null;
-                        }
-                        const found = findBody(aMimeMsg);
-                        if (found) {
-                          let extracted = found.text;
-                          if (found.isHtml) {
-                            extracted = stripHtml(extracted);
-                            bodyIsHtml = false;
-                          } else {
-                            bodyIsHtml = false;
-                          }
-                          body = extracted;
-                        } else {
-                          body = "(Could not extract body text)";
-                        }
-                      } catch {
-                        body = "(Could not extract body text)";
-                      }
-                    }
+                    if (!body) body = "(Could not extract body text)";
 
                     // Always collect attachment metadata
                     const attachments = [];
@@ -1378,14 +1366,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                   MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
                     try {
-                      let originalBody = "";
-                      if (aMimeMsg) {
-                        try {
-                          originalBody = aMimeMsg.coerceBodyToPlaintext() || "";
-                        } catch {
-                          originalBody = "";
-                        }
-                      }
+                      const originalBody = extractPlainTextBody(aMimeMsg);
 
                       const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
                         .getService(Ci.nsIMsgComposeService);
@@ -1514,14 +1495,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       composeFields.subject = origSubject.startsWith("Fwd:") ? origSubject : `Fwd: ${origSubject}`;
 
                       // Get original body
-                      let originalBody = "";
-                      if (aMimeMsg) {
-                        try {
-                          originalBody = aMimeMsg.coerceBodyToPlaintext() || "";
-                        } catch {
-                          originalBody = "";
-                        }
-                      }
+                      const originalBody = extractPlainTextBody(aMimeMsg);
 
                       // Build forward header block
                       const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
