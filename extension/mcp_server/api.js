@@ -178,6 +178,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "createTask",
+        title: "Create Task",
+        description: "Open a pre-filled task dialog in Thunderbird for user review before saving",
+        inputSchema: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Task title" },
+            dueDate: { type: "string", description: "Due date in ISO 8601 format (optional)" },
+            calendarId: { type: "string", description: "Target calendar ID (from listCalendars, must have supportsTasks=true)" },
+          },
+          required: ["title"],
+        },
+      },
+      {
         name: "searchContacts",
         title: "Search Contacts",
         description: "Find contacts the user interacted with",
@@ -430,6 +444,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             let cal = null;
             let CalEvent = null;
+            let CalTodo = null;
             try {
               const calModule = ChromeUtils.importESModule(
                 "resource:///modules/calendar/calUtils.sys.mjs"
@@ -439,6 +454,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 "resource:///modules/CalEvent.sys.mjs"
               );
               CalEvent = CE;
+              const { CalTodo: CT } = ChromeUtils.importESModule(
+                "resource:///modules/CalTodo.sys.mjs"
+              );
+              CalTodo = CT;
             } catch {
               // Calendar not available
             }
@@ -1004,7 +1023,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   id: c.id,
                   name: c.name,
                   type: c.type,
-                  readOnly: c.readOnly
+                  readOnly: c.readOnly,
+                  supportsEvents: c.getProperty("capabilities.events.supported") !== false,
+                  supportsTasks: c.getProperty("capabilities.tasks.supported") !== false,
                 }));
               } catch (e) {
                 return { error: e.toString() };
@@ -1346,6 +1367,47 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 await calendar.deleteItem(item);
                 return { success: true, deleted: eventId };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function createTask(title, dueDate, calendarId) {
+              if (!cal || !CalTodo) return { error: "Calendar module not available" };
+              try {
+                const win = Services.wm.getMostRecentWindow("mail:3pane");
+                if (!win) return { error: "No Thunderbird window found" };
+
+                let dueDt = null;
+                if (dueDate) {
+                  const js = new Date(dueDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
+                  // Date-only string (no "T") means all-day
+                  if (!dueDate.includes("T")) {
+                    dueDt = cal.createDateTime();
+                    dueDt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                    dueDt.isDate = true;
+                  } else {
+                    dueDt = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  }
+                }
+
+                // Find target calendar (must support tasks)
+                let targetCalendar = null;
+                if (calendarId) {
+                  targetCalendar = cal.manager.getCalendars().find(c => c.id === calendarId);
+                  if (!targetCalendar) return { error: `Calendar not found: ${calendarId}` };
+                  if (targetCalendar.readOnly) return { error: `Calendar is read-only: ${targetCalendar.name}` };
+                  if (targetCalendar.getProperty("capabilities.tasks.supported") === false) {
+                    return { error: `Calendar "${targetCalendar.name}" does not support tasks. Use listCalendars to find one with supportsTasks=true.` };
+                  }
+                }
+
+                // Cross-context CalTodo objects cause silent save failure in dialog.
+                // Pass title as summary param; TB creates its own CalTodo internally.
+                win.createTodoWithDialog(targetCalendar, dueDt, title, null);
+
+                return { success: true, message: `Task dialog opened for "${title}"` };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -2697,6 +2759,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId);
+                case "createTask":
+                  return createTask(args.title, args.dueDate, args.calendarId);
                 case "sendMail":
                   return composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "replyToMessage":
