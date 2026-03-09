@@ -112,14 +112,19 @@ function forwardToThunderbird(message) {
   const postData = JSON.stringify(message);
 
   // Try each host in order - handles platforms where 'localhost' resolves to
-  // IPv6 (::1) but the extension only listens on IPv4 (127.0.0.1), or vice versa.
+  // IPv6 (::1) but the extension only listens on IPv4 (127.0.0.1).
   const tryNext = (hosts) => {
     const [hostname, ...rest] = hosts;
     return tryRequest(hostname, postData).catch((err) => {
       if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
         return tryNext(rest);
       }
-      throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
+      // Only wrap connection-level errors with the "Is Thunderbird running?" hint.
+      // Timeout, JSON parse, and other errors should propagate with their original message.
+      if (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT') {
+        throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
+      }
+      throw err;
     });
   };
 
