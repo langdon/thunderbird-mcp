@@ -602,22 +602,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               // Decode entities in a single pass
               const NAMED_ENTITIES = {
-                nbsp: " ",
-                amp: "&",
-                lt: "<",
-                gt: ">",
-                quot: "\"",
-                apos: "'",
+                nbsp: " ", amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'",
                 "#39": "'",
+                mdash: "\u2014", ndash: "\u2013", hellip: "\u2026",
+                lsquo: "\u2018", rsquo: "\u2019", ldquo: "\u201C", rdquo: "\u201D",
+                bull: "\u2022", middot: "\u00B7", ensp: "\u2002", emsp: "\u2003",
+                thinsp: "\u2009", zwnj: "\u200C", zwj: "\u200D",
+                laquo: "\u00AB", raquo: "\u00BB",
+                copy: "\u00A9", reg: "\u00AE", trade: "\u2122", deg: "\u00B0",
+                plusmn: "\u00B1", times: "\u00D7", divide: "\u00F7",
+                micro: "\u00B5", para: "\u00B6", sect: "\u00A7",
+                euro: "\u20AC", pound: "\u00A3", yen: "\u00A5", cent: "\u00A2",
               };
               text = text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/gi, (match, entity) => {
                 if (entity.startsWith("#x") || entity.startsWith("#X")) {
                   const cp = parseInt(entity.slice(2), 16);
-                  return cp ? String.fromCodePoint(cp) : match;
+                  if (!cp || cp > 0x10FFFF) return match;
+                  try { return String.fromCodePoint(cp); } catch { return match; }
                 }
                 if (entity.startsWith("#")) {
                   const cp = parseInt(entity.slice(1), 10);
-                  return cp ? String.fromCodePoint(cp) : match;
+                  if (!cp || cp > 0x10FFFF) return match;
+                  try { return String.fromCodePoint(cp); } catch { return match; }
                 }
                 return NAMED_ENTITIES[entity.toLowerCase()] || match;
               });
@@ -644,6 +650,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               try {
                 function findBody(part) {
                   const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
+                  // Skip nested messages (attached emails) -- their body is not ours
+                  if (ct === "message/rfc822") return null;
                   if (ct === "text/plain" && part.body) return { text: part.body, isHtml: false };
                   if (ct === "text/html" && part.body) return { text: part.body, isHtml: true };
                   if (part.parts) {
