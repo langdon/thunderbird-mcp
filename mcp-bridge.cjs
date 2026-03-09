@@ -65,6 +65,27 @@ async function handleMessage(line) {
     return null;
   }
 
+  // Handle MCP lifecycle methods locally so the bridge can complete
+  // handshake even when Thunderbird isn't running yet.
+  switch (message.method) {
+    case 'initialize':
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'thunderbird-mcp', version: '0.1.0' }
+        }
+      };
+    case 'ping':
+      return { jsonrpc: '2.0', id: message.id, result: {} };
+    case 'resources/list':
+      return { jsonrpc: '2.0', id: message.id, result: { resources: [] } };
+    case 'prompts/list':
+      return { jsonrpc: '2.0', id: message.id, result: { prompts: [] } };
+  }
+
   return forwardToThunderbird(message);
 }
 
