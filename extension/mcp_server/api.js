@@ -82,7 +82,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           properties: {
             messageId: { type: "string", description: "The message ID (from searchMessages results)" },
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
-            saveAttachments: { type: "boolean", description: "If true, save attachments to /tmp/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" }
+            saveAttachments: { type: "boolean", description: "If true, save attachments to <OS temp dir>/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" }
           },
           required: ["messageId", "folderPath"],
         },
@@ -1573,8 +1573,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
 
                     function ensureAttachmentDir(sanitizedId) {
-                      const root = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
-                      root.initWithPath("/tmp/thunderbird-mcp");
+                      const root = Services.dirsvc.get("TmpD", Ci.nsIFile);
+                      root.append("thunderbird-mcp");
                       try {
                         root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
                       } catch (e) {
