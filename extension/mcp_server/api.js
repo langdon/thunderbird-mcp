@@ -21,6 +21,9 @@ const resProto = Cc[
 const MCP_PORT = 8765;
 // Keep references to active attach timers to prevent GC before they fire.
 const _attachTimers = new Set();
+// Track temp files created for inline base64 attachments (cleaned up on shutdown).
+const _tempAttachFiles = new Set();
+const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 attachments
 // Delay before injecting attachments into a newly opened compose window.
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
@@ -106,7 +109,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", items: { type: "string" }, description: "Array of file paths to attach" },
+            attachments: { type: "array", description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
           },
           required: ["to", "subject", "body"],
         },
@@ -224,7 +227,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", items: { type: "string" }, description: "Array of file paths to attach" },
+            attachments: { type: "array", description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
           },
           required: ["messageId", "folderPath", "body"],
         },
@@ -244,7 +247,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", items: { type: "string" }, description: "Array of additional file paths to attach" },
+            attachments: { type: "array", description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
           },
           required: ["messageId", "folderPath", "to"],
         },
@@ -675,20 +678,70 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Converts local file paths to attachment descriptors, validating existence upfront.
              * Returns { descs: [{url, name, size}], failed: string[] }
              */
+            /**
+             * Converts attachment entries to attachment descriptors.
+             * Each entry can be:
+             *   - A string (file path) — resolved from disk
+             *   - An object { name, contentType, base64 } — decoded and written
+             *     to a temp file under <TmpD>/thunderbird-mcp/attachments/
+             * Returns { descs: [{url, name, size, contentType?}], failed: string[] }
+             */
             function filePathsToAttachDescs(filePaths) {
               const descs = [];
               const failed = [];
               if (!filePaths || !Array.isArray(filePaths)) return { descs, failed };
-              for (const filePath of filePaths) {
+              for (const entry of filePaths) {
                 try {
-                  const file = createLocalFile(filePath);
-                  if (file.exists()) {
-                    descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: file.fileSize });
+                  if (typeof entry === "string") {
+                    // File path attachment
+                    const file = createLocalFile(entry);
+                    if (file.exists()) {
+                      descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: file.fileSize });
+                    } else {
+                      failed.push(entry);
+                    }
+                  } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
+                    // Inline base64 attachment — decode and write to temp file
+                    const b64Data = entry.base64 || entry.content;
+                    if (b64Data.length > MAX_BASE64_SIZE) {
+                      failed.push(`${entry.name} (exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB size limit)`);
+                      continue;
+                    }
+                    const raw = atob(b64Data);
+                    const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+                    tmpDir.append("thunderbird-mcp");
+                    tmpDir.append("attachments");
+                    if (!tmpDir.exists()) {
+                      tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+                    }
+                    const tmpFile = tmpDir.clone();
+                    const safeName = (entry.name || entry.filename || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
+                    tmpFile.append(`${Date.now()}_${safeName}`);
+                    // Write in chunks via XPCOM binary stream to avoid stack overflow on large files
+                    const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                      .createInstance(Ci.nsIFileOutputStream);
+                    ostream.init(tmpFile, 0x02 | 0x08 | 0x20, 0o600, 0);
+                    const bstream = Cc["@mozilla.org/binaryoutputstream;1"]
+                      .createInstance(Ci.nsIBinaryOutputStream);
+                    bstream.setOutputStream(ostream);
+                    const CHUNK = 65536;
+                    for (let i = 0; i < raw.length; i += CHUNK) {
+                      const chunk = raw.substring(i, i + CHUNK);
+                      const bytes = new Uint8Array(chunk.length);
+                      for (let j = 0; j < chunk.length; j++) bytes[j] = chunk.charCodeAt(j);
+                      bstream.writeByteArray(bytes, bytes.length);
+                    }
+                    bstream.close();
+                    ostream.close();
+                    _tempAttachFiles.add(tmpFile.path);
+                    const desc = { url: Services.io.newFileURI(tmpFile).spec, name: entry.name || entry.filename, size: tmpFile.fileSize };
+                    if (entry.contentType) desc.contentType = entry.contentType;
+                    descs.push(desc);
                   } else {
-                    failed.push(filePath);
+                    failed.push(typeof entry === "object" ? JSON.stringify(entry) : String(entry));
                   }
-                } catch {
-                  failed.push(filePath);
+                } catch (e) {
+                  failed.push(typeof entry === "object" ? (entry.name || JSON.stringify(entry)) : String(entry));
                 }
               }
               return { descs, failed };
@@ -3184,6 +3237,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
   onShutdown(isAppShutdown) {
     if (isAppShutdown) return;
+    // Clean up temp attachment files
+    for (const tmpPath of _tempAttachFiles) {
+      try {
+        const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+        f.initWithPath(tmpPath);
+        if (f.exists()) f.remove(false);
+      } catch {}
+    }
+    _tempAttachFiles.clear();
     resProto.setSubstitution("thunderbird-mcp", null);
     Services.obs.notifyObservers(null, "startupcache-invalidate");
   }
