@@ -382,7 +382,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "deleteFolder",
         title: "Delete Folder",
-        description: "Delete a mail folder and all its contents. Moves to Trash, or permanently deletes if already in Trash. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
+        description: "Delete a mail folder and all its contents. Moves to Trash, or permanently deletes if already in Trash. Note: permanent deletion may prompt the user for confirmation. On IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
         inputSchema: {
           type: "object",
           properties: {
@@ -760,12 +760,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(`${entry.name} (exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB size limit)`);
                       continue;
                     }
-                    let raw;
+                    // Decode base64 to binary bytes
+                    let bytes;
                     try {
-                      raw = atob(b64Data);
+                      // Use the global atob when available, otherwise fall back
+                      const raw = typeof atob === "function" ? atob(b64Data) : ChromeUtils.base64Decode(b64Data);
+                      bytes = new Uint8Array(raw.length);
+                      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
                     } catch {
-                      failed.push(`${entry.name} (invalid base64 data)`);
-                      continue;
+                      // Fallback: manual base64 decode (atob may not be available in XPCOM context)
+                      try {
+                        const lookup = new Uint8Array(256);
+                        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                        for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
+                        const clean = b64Data.replace(/[^A-Za-z0-9+/]/g, "");
+                        const len = clean.length;
+                        const outLen = (len * 3) >> 2;
+                        bytes = new Uint8Array(outLen);
+                        let p = 0;
+                        for (let i = 0; i < len; i += 4) {
+                          const a = lookup[clean.charCodeAt(i)];
+                          const b = lookup[clean.charCodeAt(i + 1)];
+                          const c = lookup[clean.charCodeAt(i + 2)];
+                          const d = lookup[clean.charCodeAt(i + 3)];
+                          bytes[p++] = (a << 2) | (b >> 4);
+                          if (i + 2 < len) bytes[p++] = ((b & 15) << 4) | (c >> 2);
+                          if (i + 3 < len) bytes[p++] = ((c & 3) << 6) | d;
+                        }
+                        bytes = bytes.subarray(0, p);
+                      } catch {
+                        failed.push(`${entry.name} (invalid base64 data)`);
+                        continue;
+                      }
                     }
                     const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
                     tmpDir.append("thunderbird-mcp");
@@ -776,20 +802,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const tmpFile = tmpDir.clone();
                     const safeName = (entry.name || entry.filename || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
                     tmpFile.append(`${Date.now()}_${++_tempFileCounter}_${safeName}`);
-                    // Write in chunks via XPCOM binary stream to avoid stack overflow on large files
+                    // Write via XPCOM binary stream
                     const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
                       .createInstance(Ci.nsIFileOutputStream);
                     ostream.init(tmpFile, 0x02 | 0x08 | 0x20, 0o600, 0);
                     const bstream = Cc["@mozilla.org/binaryoutputstream;1"]
                       .createInstance(Ci.nsIBinaryOutputStream);
                     bstream.setOutputStream(ostream);
-                    const CHUNK = 65536;
-                    for (let i = 0; i < raw.length; i += CHUNK) {
-                      const chunk = raw.substring(i, i + CHUNK);
-                      const bytes = new Uint8Array(chunk.length);
-                      for (let j = 0; j < chunk.length; j++) bytes[j] = chunk.charCodeAt(j);
-                      bstream.writeByteArray(bytes, bytes.length);
-                    }
+                    bstream.writeByteArray(bytes, bytes.length);
                     bstream.close();
                     ostream.close();
                     _tempAttachFiles.add(tmpFile.path);
@@ -2686,6 +2706,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!folder) {
                   return { error: `Folder not found: ${folderPath}` };
                 }
+                const folderName = folder.prettyName || folder.name || folderPath;
 
                 const parent = folder.parent;
                 if (!parent) {
@@ -2707,17 +2728,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 if (inTrash) {
-                  // Permanently delete
-                  parent.deleteSubFolders([folder], null);
-                  return { success: true, message: `Folder "${folder.prettyName}" permanently deleted` };
+                  // Permanently delete — deleteSelf requires a msgWindow
+                  const win = Services.wm.getMostRecentWindow("mail:3pane");
+                  folder.deleteSelf(win?.msgWindow ?? null);
+                  return { success: true, message: `Folder "${folderName}" permanently deleted` };
                 } else {
                   // Move to trash
                   const trashFolder = findTrashFolder(folder);
                   if (!trashFolder) {
                     return { error: "Trash folder not found" };
                   }
-                  MailServices.copy.copyFolders([folder], trashFolder, true, null, null);
-                  return { success: true, message: `Folder "${folder.prettyName}" moved to Trash` };
+                  MailServices.copy.copyFolder(folder, trashFolder, true, null, null);
+                  return { success: true, message: `Folder "${folderName}" moved to Trash` };
                 }
               } catch (e) {
                 return { error: e.toString() };
@@ -2737,20 +2759,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!folder) {
                   return { error: `Folder not found: ${folderPath}` };
                 }
+                const folderName = folder.prettyName || folder.name || folderPath;
 
                 const newParent = MailServices.folderLookup.getFolderForURL(newParentPath);
                 if (!newParent) {
                   return { error: `Destination folder not found: ${newParentPath}` };
                 }
+                const parentName = newParent.prettyName || newParent.name || newParentPath;
 
                 if (folder.parent && folder.parent.URI === newParentPath) {
                   return { error: "Folder is already under this parent" };
                 }
 
-                MailServices.copy.copyFolders([folder], newParent, true, null, null);
+                MailServices.copy.copyFolder(folder, newParent, true, null, null);
                 return {
                   success: true,
-                  message: `Folder "${folder.prettyName}" moved to "${newParent.prettyName}"`,
+                  message: `Folder "${folderName}" moved to "${parentName}"`,
                 };
               } catch (e) {
                 return { error: e.toString() };
