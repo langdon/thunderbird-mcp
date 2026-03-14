@@ -591,12 +591,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Removes the internal _dateTs property from each result.
              * Returns { messages, totalMatches, offset, limit, hasMore }.
              */
+            /**
+             * Apply offset-based pagination to a sorted results array.
+             * Removes the internal _dateTs property from each result.
+             *
+             * Backward-compatible: when offset is undefined/null (not provided),
+             * returns a plain array. When offset is explicitly provided (even 0),
+             * returns structured { messages, totalMatches, offset, limit, hasMore }.
+             * Note: totalMatches is capped at SEARCH_COLLECTION_CAP and may underreport.
+             */
             function paginate(results, offset, effectiveLimit) {
-              const effectiveOffset = Number.isFinite(Number(offset)) && Number(offset) > 0 ? Math.floor(Number(offset)) : 0;
+              const offsetProvided = offset !== undefined && offset !== null;
+              const effectiveOffset = offsetProvided && Number.isFinite(Number(offset)) && Number(offset) > 0
+                ? Math.floor(Number(offset)) : 0;
               const page = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(r => {
                 delete r._dateTs;
                 return r;
               });
+              if (!offsetProvided) {
+                return page;
+              }
               return {
                 messages: page,
                 totalMatches: results.length,
@@ -3478,7 +3492,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               // Check types and reject unknown properties
               for (const [key, value] of Object.entries(args)) {
-                const propSchema = props[key];
+                // Use hasOwnProperty to prevent inherited properties like
+                // 'constructor' or 'toString' from bypassing unknown-param checks.
+                const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
                 if (!propSchema) {
                   errors.push(`Unknown parameter: ${key}`);
                   continue;
@@ -3500,6 +3516,37 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               return errors;
+            }
+
+            /**
+             * Coerce tool arguments to match expected schema types.
+             * MCP clients may send "true"/"false" as strings for booleans,
+             * "50" as strings for numbers, or JSON-encoded arrays as strings.
+             * Mutates and returns the args object.
+             */
+            function coerceToolArgs(name, args) {
+              const schema = toolSchemas[name];
+              if (!schema) return args;
+              const props = schema.properties || {};
+              for (const [key, value] of Object.entries(args)) {
+                if (value === undefined || value === null) continue;
+                const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
+                if (!propSchema) continue;
+                const expected = propSchema.type;
+                if (expected === "boolean" && typeof value === "string") {
+                  if (value === "true") args[key] = true;
+                  else if (value === "false") args[key] = false;
+                } else if (expected === "number" && typeof value === "string") {
+                  const n = Number(value);
+                  if (Number.isFinite(n)) args[key] = n;
+                } else if (expected === "array" && typeof value === "string") {
+                  try {
+                    const parsed = JSON.parse(value);
+                    if (Array.isArray(parsed)) args[key] = parsed;
+                  } catch { /* leave as-is for validation to catch */ }
+                }
+              }
+              return args;
             }
 
             async function callTool(name, args) {
@@ -3668,7 +3715,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         throw new Error("Missing tool name");
                       }
                       {
-                        const toolArgs = params.arguments || {};
+                        const toolArgs = coerceToolArgs(params.name, params.arguments || {});
                         const validationErrors = validateToolArgs(params.name, toolArgs);
                         if (validationErrors.length > 0) {
                           throw new Error(`Invalid parameters for '${params.name}': ${validationErrors.join("; ")}`);
