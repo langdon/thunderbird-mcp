@@ -657,6 +657,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Injects attachment descriptors into the most recently opened compose window.
              * Uses nsITimer so the window has time to finish loading before injection.
              * Each call gets its own timer stored in _attachTimers to prevent GC.
+             *
+             * Known limitation: uses getMostRecentWindow("msgcompose") which is a race
+             * if two compose operations happen within COMPOSE_WINDOW_LOAD_DELAY_MS --
+             * attachments from the first may land on the second window.
+             * OpenComposeWindowWithParams doesn't return a window handle, so there's
+             * no reliable way to target a specific window. Injection failures are
+             * silent (callers report success based on pre-validated descriptor counts).
              */
             function injectAttachmentsAsync(attachDescs) {
               if (!attachDescs || attachDescs.length === 0) return;
