@@ -150,13 +150,12 @@ describe('Auth: connection info file', () => {
     }
   });
 
-  it('bridge falls back to default port when connection file is missing', async () => {
+  it('bridge fails closed when connection file is missing', async () => {
     // Remove connection file
     try { fs.unlinkSync(CONN_FILE); } catch { /* ignore */ }
 
-    // The bridge should try port 8765 — we won't mock it, so we expect
-    // either a connection error or a response from real Thunderbird.
-    // We just verify it doesn't crash.
+    // With fail-closed auth, the bridge must refuse to forward requests
+    // when it can't find the connection file (no fallback to default port).
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 2,
@@ -164,8 +163,8 @@ describe('Auth: connection info file', () => {
     });
 
     assert.equal(response.id, 2);
-    // Either a valid result (real Thunderbird) or an error (connection refused)
-    assert.ok(response.result || response.error);
+    assert.ok(response.error, 'should return an error when connection file is missing');
+    assert.match(response.error.message, /Connection file not found|Bridge error/);
   });
 });
 

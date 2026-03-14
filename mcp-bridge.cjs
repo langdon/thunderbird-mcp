@@ -12,10 +12,11 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const THUNDERBIRD_DEFAULT_PORT = 8765;
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
 const CONNECTION_FILE = path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json');
+const CONNECTION_RETRY_DELAY_MS = 1000;
+const CONNECTION_MAX_RETRIES = 5;
 
 /**
  * Read connection info (port + auth token) written by the Thunderbird extension.
@@ -166,14 +167,33 @@ function tryRequest(hostname, postData, port, token) {
   });
 }
 
-function forwardToThunderbird(message) {
+async function forwardToThunderbird(message) {
   const postData = JSON.stringify(message);
 
   // Read connection info (port + auth token) from the file written by the extension.
-  // Falls back to default port with no auth if the file doesn't exist (backward compat).
-  const connInfo = readConnectionInfo();
-  const port = connInfo?.port || THUNDERBIRD_DEFAULT_PORT;
-  const token = connInfo?.token || null;
+  // Fail-closed: if the connection file is missing, retry a few times
+  // (Thunderbird may still be starting), then fail with an error.
+  // Never forward requests without authentication.
+  let connInfo = readConnectionInfo();
+  if (!connInfo) {
+    for (let attempt = 0; attempt < CONNECTION_MAX_RETRIES; attempt++) {
+      await new Promise(r => setTimeout(r, CONNECTION_RETRY_DELAY_MS));
+      connInfo = readConnectionInfo();
+      if (connInfo) break;
+    }
+    if (!connInfo) {
+      throw new Error(
+        'Connection file not found. Is Thunderbird running with the MCP extension? ' +
+        'The extension must be started first to create the connection file.'
+      );
+    }
+  }
+
+  if (!connInfo.port || !connInfo.token) {
+    throw new Error('Invalid connection file: missing port or token');
+  }
+
+  const { port, token } = connInfo;
 
   // Try each host in order - handles platforms where 'localhost' resolves to
   // IPv6 (::1) but the extension only listens on IPv4 (127.0.0.1).

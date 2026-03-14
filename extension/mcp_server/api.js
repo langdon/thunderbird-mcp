@@ -612,10 +612,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               const connFile = tmpDir.clone();
               connFile.append("connection.json");
+              // Symlink defense: remove any existing file first, then create
+              // with O_CREAT|O_EXCL (0x08|0x80) to fail if a symlink appeared
+              // between remove and create.
+              if (connFile.exists()) {
+                connFile.remove(false);
+              }
               const data = JSON.stringify({ port, token, pid: Services.appinfo.processID });
               const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
                 .createInstance(Ci.nsIFileOutputStream);
-              ostream.init(connFile, 0x02 | 0x08 | 0x20, 0o600, 0);
+              // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x80 = O_EXCL
+              ostream.init(connFile, 0x02 | 0x08 | 0x80, 0o600, 0);
               const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
                 .createInstance(Ci.nsIConverterOutputStream);
               converter.init(ostream, "UTF-8");
@@ -642,6 +649,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             const authToken = generateAuthToken();
+
+            /**
+             * Constant-time string comparison to prevent timing side-channel attacks.
+             */
+            function timingSafeEqual(a, b) {
+              const aStr = String(a);
+              const bStr = String(b);
+              const len = Math.max(aStr.length, bStr.length);
+              let result = aStr.length ^ bStr.length;
+              for (let i = 0; i < len; i++) {
+                result |= (aStr.charCodeAt(i) || 0) ^ (bStr.charCodeAt(i) || 0);
+              }
+              return result === 0;
+            }
 
             /**
              * Lists all email accounts and their identities.
@@ -721,21 +742,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function getAccountAccess() {
               const allowed = getAllowedAccountIds();
-              // Also return all available accounts for reference
-              const allAccounts = [];
+              // Only return accessible accounts — restricted accounts are hidden
+              const accessibleAccounts = [];
               for (const account of MailServices.accounts.accounts) {
+                if (!isAccountAllowed(account.key)) continue;
                 const server = account.incomingServer;
-                allAccounts.push({
+                accessibleAccounts.push({
                   id: account.key,
                   name: server.prettyName,
                   type: server.type,
-                  allowed: allowed.length === 0 || allowed.includes(account.key),
                 });
               }
               return {
                 mode: allowed.length === 0 ? "all" : "restricted",
-                allowedAccountIds: allowed,
-                accounts: allAccounts,
+                accounts: accessibleAccounts,
               };
             }
 
@@ -1127,22 +1147,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Sets compose identity from `from` param or falls back to default.
              * Returns warning string if `from` was specified but not found.
              */
-	            function setComposeIdentity(msgComposeParams, from, fallbackServer) {
-	              const identity = findIdentity(from);
-	              if (identity) {
-	                msgComposeParams.identity = identity;
-	                return "";
-	              }
+            function setComposeIdentity(msgComposeParams, from, fallbackServer) {
+              const identity = findIdentity(from);
+              if (identity) {
+                // Verify the identity's account is accessible
+                for (const account of MailServices.accounts.accounts) {
+                  const identities = account.identities;
+                  for (let i = 0; i < identities.length; i++) {
+                    if (identities[i].key === identity.key) {
+                      if (!isAccountAllowed(account.key)) {
+                        return `identity ${from} belongs to restricted account, using default`;
+                      }
+                      break;
+                    }
+                  }
+                }
+                msgComposeParams.identity = identity;
+                return "";
+              }
               // Fallback to default identity for the account
               if (fallbackServer) {
                 const account = MailServices.accounts.findAccountForServer(fallbackServer);
-                if (account) msgComposeParams.identity = account.defaultIdentity;
+                if (account && isAccountAllowed(account.key)) {
+                  msgComposeParams.identity = account.defaultIdentity;
+                }
               } else {
                 const defaultAccount = MailServices.accounts.defaultAccount;
-                if (defaultAccount) msgComposeParams.identity = defaultAccount.defaultIdentity;
+                if (defaultAccount && isAccountAllowed(defaultAccount.key)) {
+                  msgComposeParams.identity = defaultAccount.defaultIdentity;
+                }
               }
-	              return from ? `unknown identity: ${from}, using default` : "";
-	            }
+              return from ? `unknown identity: ${from}, using default` : "";
+            }
 
 	            /**
 	             * Opens a folder and its message database.
@@ -3516,7 +3552,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               } catch {
                 // getHeader throws if header is missing in httpd.sys.mjs
               }
-              if (reqToken !== `Bearer ${authToken}`) {
+              if (!timingSafeEqual(reqToken, `Bearer ${authToken}`)) {
                 res.setStatusLine("1.1", 403, "Forbidden");
                 res.setHeader("Content-Type", "application/json; charset=utf-8", false);
                 res.write(JSON.stringify({
