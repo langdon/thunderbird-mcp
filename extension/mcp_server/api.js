@@ -83,6 +83,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
             endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date" },
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
+            offset: { type: "number", description: "Number of results to skip for pagination (default 0). Use with maxResults to page through large result sets." },
             sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
@@ -316,6 +317,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "Folder URI to list messages from (defaults to all Inboxes)" },
             daysBack: { type: "number", description: "Only return messages from the last N days (default: 7)" },
             maxResults: { type: "number", description: "Maximum number of results (default: 50, max: 200)" },
+            offset: { type: "number", description: "Number of results to skip for pagination (default 0). Use with maxResults to page through results." },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
           },
@@ -1288,7 +1290,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, sortOrder, unreadOnly, flaggedOnly, tag) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag) {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -1391,10 +1393,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
 
-              return results.slice(0, effectiveLimit).map(result => {
+              const effectiveOffset = Number.isFinite(Number(offset)) && Number(offset) > 0 ? Math.floor(Number(offset)) : 0;
+              const page = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(result => {
                 delete result._dateTs;
                 return result;
               });
+
+              return {
+                messages: page,
+                totalMatches: results.length,
+                offset: effectiveOffset,
+                limit: effectiveLimit,
+                hasMore: effectiveOffset + effectiveLimit < results.length
+              };
             }
 
             function searchContacts(query) {
@@ -2536,7 +2547,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-            function getRecentMessages(folderPath, daysBack, maxResults, unreadOnly, flaggedOnly) {
+            function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly) {
               const results = [];
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
               const cutoffTs = (Date.now() - days * 86400000) * 1000; // Thunderbird uses microseconds
@@ -2608,10 +2619,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => b._dateTs - a._dateTs);
 
-              return results.slice(0, effectiveLimit).map(r => {
+              const effectiveOffset = Number.isFinite(Number(offset)) && Number(offset) > 0 ? Math.floor(Number(offset)) : 0;
+              const page = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(r => {
                 delete r._dateTs;
                 return r;
               });
+
+              return {
+                messages: page,
+                totalMatches: results.length,
+                offset: effectiveOffset,
+                limit: effectiveLimit,
+                hasMore: effectiveOffset + effectiveLimit < results.length
+              };
             }
 
             function deleteMessages(messageIds, folderPath) {
@@ -3493,7 +3513,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag);
+                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
@@ -3523,7 +3543,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
                 case "getRecentMessages":
-                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.unreadOnly, args.flaggedOnly);
+                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly);
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
