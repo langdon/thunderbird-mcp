@@ -3546,6 +3546,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (value === "true") args[key] = true;
                   else if (value === "false") args[key] = false;
                 } else if (expected === "number" && typeof value === "string") {
+                  // Reject blank/whitespace strings -- Number("") is 0 which
+                  // would silently coerce empty input into a valid number.
+                  if (value.trim() === "") continue;
                   const n = Number(value);
                   if (Number.isFinite(n)) args[key] = n;
                 } else if (expected === "array" && typeof value === "string") {
