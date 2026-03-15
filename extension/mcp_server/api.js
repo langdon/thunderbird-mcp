@@ -36,11 +36,12 @@ const ALL_TOOL_NAMES = [
   "listAccounts", "listFolders", "searchMessages", "getMessage",
   "sendMail", "replyToMessage", "forwardMessage", "deleteMessages",
   "updateMessage", "getRecentMessages", "createFolder", "renameFolder",
-  "deleteFolder", "moveFolder", "searchContacts", "createContact",
-  "updateContact", "deleteContact", "listCalendars", "createEvent",
-  "listEvents", "updateEvent", "deleteEvent", "createTask",
-  "listFilters", "createFilter", "updateFilter", "deleteFilter",
-  "reorderFilters", "applyFilters", "getAccountAccess",
+  "deleteFolder", "emptyTrash", "emptyJunk", "moveFolder",
+  "searchContacts", "createContact", "updateContact", "deleteContact",
+  "listCalendars", "createEvent", "listEvents", "updateEvent",
+  "deleteEvent", "createTask", "listFilters", "createFilter",
+  "updateFilter", "deleteFilter", "reorderFilters", "applyFilters",
+  "getAccountAccess",
 ];
 // Tools that cannot be disabled via the settings page (infrastructure tools)
 const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccess"]);
@@ -103,6 +104,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
             tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." },
             includeSubfolders: { type: "boolean", description: "If false, only search the specified folder — not its subfolders. Default: true." },
+            countOnly: { type: "boolean", description: "If true, return only the match count instead of full results. Much faster for 'how many unread?' queries." },
           },
           required: ["query"],
         },
@@ -410,6 +412,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "URI of the folder to delete (from listFolders)" },
           },
           required: ["folderPath"],
+        },
+      },
+      {
+        name: "emptyTrash",
+        title: "Empty Trash",
+        description: "Permanently delete all messages in the Trash folder for an account.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Account ID (from listAccounts). If omitted, empties Trash for all accessible accounts." },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "emptyJunk",
+        title: "Empty Junk",
+        description: "Permanently delete all messages in the Junk/Spam folder for an account.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Account ID (from listAccounts). If omitted, empties Junk for all accessible accounts." },
+          },
+          required: [],
         },
       },
       {
@@ -1382,7 +1408,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly) {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -1491,6 +1517,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (results.length >= SEARCH_COLLECTION_CAP) break;
                   searchFolder(account.incomingServer.rootFolder);
                 }
+              }
+
+              if (countOnly) {
+                return { count: results.length };
               }
 
               results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
@@ -3067,6 +3097,84 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function emptySpecialFolder(accountId, flagBit, folderLabel) {
+              try {
+                const accounts = accountId
+                  ? [MailServices.accounts.getAccount(accountId)].filter(Boolean)
+                  : Array.from(getAccessibleAccounts());
+                if (accountId && accounts.length === 0) {
+                  return { error: `Account not found: ${accountId}` };
+                }
+                if (accountId && !isAccountAllowed(accountId)) {
+                  return { error: `Account not accessible: ${accountId}` };
+                }
+
+                const results = [];
+                for (const account of accounts) {
+                  const root = account.incomingServer?.rootFolder;
+                  if (!root) continue;
+
+                  // Find the special folder by flag
+                  let target = null;
+                  const findByFlag = (folder) => {
+                    try {
+                      if (folder.getFlag && folder.getFlag(flagBit)) return folder;
+                    } catch {}
+                    if (folder.hasSubFolders) {
+                      for (const sub of folder.subFolders) {
+                        const found = findByFlag(sub);
+                        if (found) return found;
+                      }
+                    }
+                    return null;
+                  };
+                  target = findByFlag(root);
+
+                  if (!target) {
+                    results.push({ account: account.key, status: `no ${folderLabel} folder found` });
+                    continue;
+                  }
+
+                  const msgCount = target.getTotalMessages(false);
+                  if (msgCount === 0) {
+                    results.push({ account: account.key, folder: target.URI, status: "already empty" });
+                    continue;
+                  }
+
+                  // Delete all messages permanently
+                  const hdrs = [];
+                  try {
+                    const db = target.msgDatabase;
+                    if (db) {
+                      for (const hdr of db.enumerateMessages()) hdrs.push(hdr);
+                    }
+                  } catch {}
+
+                  if (hdrs.length > 0) {
+                    target.deleteMessages(hdrs, null, true, false, null, false);
+                  }
+                  // Compact the folder to reclaim space
+                  try { target.compact(null, null); } catch {}
+
+                  results.push({ account: account.key, folder: target.URI, deleted: hdrs.length });
+                }
+
+                return { success: true, results };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function emptyTrash(accountId) {
+              const TRASH_FLAG = 0x00000100;
+              return emptySpecialFolder(accountId, TRASH_FLAG, "Trash");
+            }
+
+            function emptyJunk(accountId) {
+              const JUNK_FLAG = 0x40000000;
+              return emptySpecialFolder(accountId, JUNK_FLAG, "Junk");
+            }
+
             function moveFolder(folderPath, newParentPath) {
               try {
                 if (typeof folderPath !== "string" || !folderPath) {
@@ -3666,7 +3774,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders);
+                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
@@ -3707,6 +3815,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return renameFolder(args.folderPath, args.newName);
                 case "deleteFolder":
                   return deleteFolder(args.folderPath);
+                case "emptyTrash":
+                  return emptyTrash(args.accountId);
+                case "emptyJunk":
+                  return emptyJunk(args.accountId);
                 case "moveFolder":
                   return moveFolder(args.folderPath, args.newParentPath);
                 case "listFilters":
