@@ -31,7 +31,7 @@ const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const MAX_SEARCH_RESULTS_CAP = 200;
-const SEARCH_COLLECTION_CAP = 1000;
+const SEARCH_COLLECTION_CAP = 10000;
 // Internal IMAP/Thunderbird keywords that should not appear as user-visible tags
 const INTERNAL_KEYWORDS = new Set([
   "junk", "notjunk", "$forwarded", "$replied",
@@ -83,7 +83,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
             endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date" },
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
-            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 1000." },
+            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 10000." },
             sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
@@ -317,7 +317,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "Folder URI (from listFolders) to list messages from. If omitted, returns messages from all Inboxes." },
             daysBack: { type: "number", description: "Only return messages from the last N days (default: 7)" },
             maxResults: { type: "number", description: "Maximum number of results (default: 50, max: 200)" },
-            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 1000." },
+            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 10000." },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
           },

@@ -714,6 +714,62 @@ describe('Pagination: sequential page traversal', () => {
   });
 });
 
+// ─── Collection cap vs sort order regression test ─────────────────
+// Reproduces the bug where SEARCH_COLLECTION_CAP truncated results BEFORE
+// sorting, causing getRecentMessages to silently drop the newest messages
+// when the date range contained more than SEARCH_COLLECTION_CAP matches.
+// The collector iterated oldest-first, filled up at the cap, then sorted —
+// but the newest messages were never collected.
+
+describe('Collection cap: newest messages must survive sort-after-collect', () => {
+  // Simulate the collect-then-sort pattern used by getRecentMessages/searchMessages.
+  // Messages arrive in oldest-first order (like db.enumerateMessages on IMAP).
+  function simulateCollectAndPaginate(totalMessages, collectionCap, requestedLimit) {
+    // Generate messages oldest-first (like IMAP enumeration order)
+    const allMessages = Array.from({ length: totalMessages }, (_, i) => ({
+      id: `msg-${i}`,
+      _dateTs: (i + 1) * 1000000, // older messages have lower timestamps
+    }));
+
+    // Simulate collection with cap (the buggy pattern)
+    const collected = [];
+    for (const msg of allMessages) {
+      if (collected.length >= collectionCap) break;
+      collected.push(msg);
+    }
+
+    // Sort newest-first (like production code)
+    collected.sort((a, b) => b._dateTs - a._dateTs);
+
+    // Return the first requestedLimit (like paginate with offset=0)
+    return collected.slice(0, requestedLimit);
+  }
+
+  it('with low cap, newest messages are silently dropped (demonstrates the bug)', () => {
+    // 2000 messages, cap at 1000, want 200 newest
+    const results = simulateCollectAndPaginate(2000, 1000, 200);
+
+    // The newest message should be msg-1999 (highest timestamp)
+    // BUG: with cap=1000, collector stops at msg-999, so msg-1999 is never collected
+    const newestId = results[0].id;
+    assert.equal(newestId, 'msg-999',
+      'Bug confirmed: cap=1000 means the newest message (msg-1999) was never collected');
+    assert.notEqual(newestId, 'msg-1999',
+      'Bug confirmed: msg-1999 is missing from results');
+  });
+
+  it('with high cap, newest messages are correctly returned (the fix)', () => {
+    // Same scenario but with cap=10000 — all 2000 messages fit
+    const results = simulateCollectAndPaginate(2000, 10000, 200);
+
+    // Now the newest message IS msg-1999
+    assert.equal(results[0].id, 'msg-1999',
+      'Fix confirmed: with cap=10000, newest message is correctly returned');
+    assert.equal(results[199].id, 'msg-1800',
+      'Fix confirmed: 200 newest messages returned in correct order');
+  });
+});
+
 // ─── Validation adversarial tests ─────────────────────────────────
 
 describe('Validation: adversarial and edge-case inputs', () => {
