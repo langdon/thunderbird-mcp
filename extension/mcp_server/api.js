@@ -32,7 +32,7 @@ const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
 // Tools that cannot be disabled via the settings page (infrastructure tools)
-const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccessConfig"]);
+const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccess"]);
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 10000;
 // Internal IMAP/Thunderbird keywords that should not appear as user-visible tags
@@ -3949,7 +3949,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             "updateContact", "deleteContact", "listCalendars", "createEvent",
             "listEvents", "updateEvent", "deleteEvent", "createTask",
             "listFilters", "createFilter", "updateFilter", "deleteFilter",
-            "reorderFilters", "applyFilters",
+            "reorderFilters", "applyFilters", "getAccountAccess",
           ];
           const toolList = allToolNames.map(name => ({
             name,
@@ -3975,6 +3975,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           // Validate: all names must be strings
           if (!disabledTools.every(t => typeof t === "string")) {
             return { error: "All tool names must be strings" };
+          }
+          // Reject internal sentinel values
+          if (disabledTools.includes("__all__")) {
+            return { error: "Invalid tool name: __all__" };
           }
 
           if (disabledTools.length === 0) {

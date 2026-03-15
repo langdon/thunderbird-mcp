@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 
 // ── Helpers that mirror production logic ──────────────────────────────
 
-const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccessConfig"]);
+const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccess"]);
 
 /**
  * Mirrors the production getDisabledTools() fail-closed behavior.
@@ -55,7 +55,7 @@ function callToolGuard(toolName, prefValue) {
 const ALL_TOOLS = [
   { name: "listAccounts" },
   { name: "listFolders" },
-  { name: "getAccountAccessConfig" },
+  { name: "getAccountAccess" },
   { name: "searchMessages" },
   { name: "getMessage" },
   { name: "sendMail" },
@@ -122,10 +122,10 @@ describe("Tool access: isToolEnabled", () => {
   });
 
   it("undisableable tools ALWAYS return true even when in disabled list", () => {
-    const pref = JSON.stringify(["listAccounts", "listFolders", "getAccountAccessConfig", "sendMail"]);
+    const pref = JSON.stringify(["listAccounts", "listFolders", "getAccountAccess", "sendMail"]);
     assert.ok(isToolEnabled("listAccounts", pref));
     assert.ok(isToolEnabled("listFolders", pref));
-    assert.ok(isToolEnabled("getAccountAccessConfig", pref));
+    assert.ok(isToolEnabled("getAccountAccess", pref));
     // But sendMail IS disabled
     assert.ok(!isToolEnabled("sendMail", pref));
   });
@@ -134,7 +134,7 @@ describe("Tool access: isToolEnabled", () => {
     const pref = "not valid json";
     assert.ok(isToolEnabled("listAccounts", pref));
     assert.ok(isToolEnabled("listFolders", pref));
-    assert.ok(isToolEnabled("getAccountAccessConfig", pref));
+    assert.ok(isToolEnabled("getAccountAccess", pref));
     // Regular tools are blocked
     assert.ok(!isToolEnabled("sendMail", pref));
     assert.ok(!isToolEnabled("deleteMessages", pref));
@@ -159,12 +159,12 @@ describe("Tool access: tools/list filtering", () => {
   });
 
   it("undisableable tools always appear in list", () => {
-    const pref = JSON.stringify(["listAccounts", "listFolders", "getAccountAccessConfig"]);
+    const pref = JSON.stringify(["listAccounts", "listFolders", "getAccountAccess"]);
     const result = filterTools(ALL_TOOLS, pref);
     const names = result.map(t => t.name);
     assert.ok(names.includes("listAccounts"));
     assert.ok(names.includes("listFolders"));
-    assert.ok(names.includes("getAccountAccessConfig"));
+    assert.ok(names.includes("getAccountAccess"));
   });
 
   it("corrupt pref shows only undisableable tools", () => {
@@ -173,7 +173,7 @@ describe("Tool access: tools/list filtering", () => {
     assert.equal(names.length, 3);
     assert.ok(names.includes("listAccounts"));
     assert.ok(names.includes("listFolders"));
-    assert.ok(names.includes("getAccountAccessConfig"));
+    assert.ok(names.includes("getAccountAccess"));
   });
 });
 
@@ -302,5 +302,83 @@ describe("Tool access: adversarial inputs", () => {
       () => callToolGuard("nonExistentTool", pref),
       { message: "Tool is disabled: nonExistentTool" }
     );
+  });
+
+  it("__all__ sentinel in disabled list blocks all regular tools", () => {
+    const pref = JSON.stringify(["__all__"]);
+    assert.ok(!isToolEnabled("sendMail", pref));
+    assert.ok(!isToolEnabled("deleteMessages", pref));
+    assert.ok(!isToolEnabled("searchContacts", pref));
+    // Undisableable tools survive
+    assert.ok(isToolEnabled("listAccounts", pref));
+    assert.ok(isToolEnabled("listFolders", pref));
+    assert.ok(isToolEnabled("getAccountAccess", pref));
+  });
+
+  it("__all__ sentinel mixed with other entries still blocks all", () => {
+    const pref = JSON.stringify(["sendMail", "__all__", "deleteMessages"]);
+    assert.ok(!isToolEnabled("searchContacts", pref));
+    assert.ok(!isToolEnabled("getMessage", pref));
+  });
+});
+
+describe("Tool access: setToolAccess validation", () => {
+  /**
+   * Mirrors the production setToolAccess validation logic.
+   */
+  function validateSetToolAccess(disabledTools) {
+    if (!Array.isArray(disabledTools)) {
+      return { error: "disabledTools must be an array" };
+    }
+    const blocked = disabledTools.filter(t => UNDISABLEABLE_TOOLS.has(t));
+    if (blocked.length > 0) {
+      return { error: `Cannot disable infrastructure tools: ${blocked.join(", ")}` };
+    }
+    if (!disabledTools.every(t => typeof t === "string")) {
+      return { error: "All tool names must be strings" };
+    }
+    if (disabledTools.includes("__all__")) {
+      return { error: "Invalid tool name: __all__" };
+    }
+    return { success: true };
+  }
+
+  it("accepts empty array (enable all)", () => {
+    assert.deepStrictEqual(validateSetToolAccess([]), { success: true });
+  });
+
+  it("accepts valid tool names", () => {
+    assert.deepStrictEqual(validateSetToolAccess(["sendMail", "deleteMessages"]), { success: true });
+  });
+
+  it("rejects non-array input", () => {
+    assert.ok(validateSetToolAccess("sendMail").error);
+    assert.ok(validateSetToolAccess(42).error);
+    assert.ok(validateSetToolAccess(null).error);
+  });
+
+  it("rejects undisableable tools", () => {
+    const result = validateSetToolAccess(["listAccounts", "sendMail"]);
+    assert.ok(result.error);
+    assert.match(result.error, /cannot disable/i);
+    assert.match(result.error, /listAccounts/);
+  });
+
+  it("rejects non-string entries", () => {
+    const result = validateSetToolAccess([42, "sendMail"]);
+    assert.ok(result.error);
+    assert.match(result.error, /strings/i);
+  });
+
+  it("SECURITY: rejects __all__ sentinel injection", () => {
+    const result = validateSetToolAccess(["__all__"]);
+    assert.ok(result.error);
+    assert.match(result.error, /__all__/);
+  });
+
+  it("SECURITY: rejects __all__ even mixed with valid tools", () => {
+    const result = validateSetToolAccess(["sendMail", "__all__", "deleteMessages"]);
+    assert.ok(result.error);
+    assert.match(result.error, /__all__/);
   });
 });
