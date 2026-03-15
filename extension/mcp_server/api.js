@@ -1479,7 +1479,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const msgTags = getUserTags(msgHdr);
                     const result = {
                       id: msgHdr.messageId,
-                      threadId: msgHdr.threadId,
+                      threadId: msgHdr.threadId, // folder-local, use with folderPath for grouping
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
                       author: msgHdr.mime2DecodedAuthor || msgHdr.author,
                       recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
@@ -2719,7 +2719,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const preview = msgHdr.getStringProperty("preview") || "";
                     const result = {
                       id: msgHdr.messageId,
-                      threadId: msgHdr.threadId,
+                      threadId: msgHdr.threadId, // folder-local, use with folderPath for grouping
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
                       author: msgHdr.mime2DecodedAuthor || msgHdr.author,
                       recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
@@ -3097,8 +3097,53 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function emptySpecialFolder(accountId, flagBit, folderLabel) {
+            /**
+             * Find a special folder by flag bit, searching the account's folder tree.
+             */
+            function findSpecialFolder(root, flagBit) {
+              const search = (folder) => {
+                try {
+                  if (folder.getFlag && folder.getFlag(flagBit)) return folder;
+                } catch {}
+                if (folder.hasSubFolders) {
+                  for (const sub of folder.subFolders) {
+                    const found = search(sub);
+                    if (found) return found;
+                  }
+                }
+                return null;
+              };
+              return search(root);
+            }
+
+            /**
+             * Recursively delete all messages in a folder and its subfolders.
+             * Returns total count of messages deleted.
+             */
+            function deleteAllMessagesRecursive(folder) {
+              let count = 0;
               try {
+                const db = folder.msgDatabase;
+                if (db) {
+                  const hdrs = [];
+                  for (const hdr of db.enumerateMessages()) hdrs.push(hdr);
+                  if (hdrs.length > 0) {
+                    folder.deleteMessages(hdrs, null, true, false, null, false);
+                    count += hdrs.length;
+                  }
+                }
+              } catch {}
+              if (folder.hasSubFolders) {
+                for (const sub of folder.subFolders) {
+                  count += deleteAllMessagesRecursive(sub);
+                }
+              }
+              return count;
+            }
+
+            function emptyTrash(accountId) {
+              try {
+                const TRASH_FLAG = 0x00000100;
                 const accounts = accountId
                   ? [MailServices.accounts.getAccount(accountId)].filter(Boolean)
                   : Array.from(getAccessibleAccounts());
@@ -3113,66 +3158,59 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 for (const account of accounts) {
                   const root = account.incomingServer?.rootFolder;
                   if (!root) continue;
-
-                  // Find the special folder by flag
-                  let target = null;
-                  const findByFlag = (folder) => {
-                    try {
-                      if (folder.getFlag && folder.getFlag(flagBit)) return folder;
-                    } catch {}
-                    if (folder.hasSubFolders) {
-                      for (const sub of folder.subFolders) {
-                        const found = findByFlag(sub);
-                        if (found) return found;
-                      }
-                    }
-                    return null;
-                  };
-                  target = findByFlag(root);
-
-                  if (!target) {
-                    results.push({ account: account.key, status: `no ${folderLabel} folder found` });
+                  const trash = findSpecialFolder(root, TRASH_FLAG);
+                  if (!trash) {
+                    results.push({ account: account.key, status: "no Trash folder found" });
                     continue;
                   }
-
-                  const msgCount = target.getTotalMessages(false);
-                  if (msgCount === 0) {
-                    results.push({ account: account.key, folder: target.URI, status: "already empty" });
-                    continue;
+                  // Use Thunderbird's native emptyTrash when available (handles
+                  // IMAP expunge, subfolders, and compaction correctly)
+                  if (typeof trash.emptyTrash === "function") {
+                    const win = Services.wm.getMostRecentWindow("mail:3pane");
+                    trash.emptyTrash(win?.msgWindow ?? null, null);
+                    results.push({ account: account.key, folder: trash.URI, status: "emptied" });
+                  } else {
+                    // Fallback: manually delete messages in folder + subfolders
+                    const deleted = deleteAllMessagesRecursive(trash);
+                    results.push({ account: account.key, folder: trash.URI, deleted });
                   }
-
-                  // Delete all messages permanently
-                  const hdrs = [];
-                  try {
-                    const db = target.msgDatabase;
-                    if (db) {
-                      for (const hdr of db.enumerateMessages()) hdrs.push(hdr);
-                    }
-                  } catch {}
-
-                  if (hdrs.length > 0) {
-                    target.deleteMessages(hdrs, null, true, false, null, false);
-                  }
-                  // Compact the folder to reclaim space
-                  try { target.compact(null, null); } catch {}
-
-                  results.push({ account: account.key, folder: target.URI, deleted: hdrs.length });
                 }
-
                 return { success: true, results };
               } catch (e) {
                 return { error: e.toString() };
               }
             }
 
-            function emptyTrash(accountId) {
-              const TRASH_FLAG = 0x00000100;
-              return emptySpecialFolder(accountId, TRASH_FLAG, "Trash");
-            }
-
             function emptyJunk(accountId) {
-              const JUNK_FLAG = 0x40000000;
-              return emptySpecialFolder(accountId, JUNK_FLAG, "Junk");
+              try {
+                const JUNK_FLAG = 0x40000000;
+                const accounts = accountId
+                  ? [MailServices.accounts.getAccount(accountId)].filter(Boolean)
+                  : Array.from(getAccessibleAccounts());
+                if (accountId && accounts.length === 0) {
+                  return { error: `Account not found: ${accountId}` };
+                }
+                if (accountId && !isAccountAllowed(accountId)) {
+                  return { error: `Account not accessible: ${accountId}` };
+                }
+
+                const results = [];
+                for (const account of accounts) {
+                  const root = account.incomingServer?.rootFolder;
+                  if (!root) continue;
+                  const junk = findSpecialFolder(root, JUNK_FLAG);
+                  if (!junk) {
+                    results.push({ account: account.key, status: "no Junk folder found" });
+                    continue;
+                  }
+                  // No native emptyJunk in Thunderbird, delete recursively
+                  const deleted = deleteAllMessagesRecursive(junk);
+                  results.push({ account: account.key, folder: junk.URI, deleted });
+                }
+                return { success: true, results };
+              } catch (e) {
+                return { error: e.toString() };
+              }
             }
 
             function moveFolder(folderPath, newParentPath) {
