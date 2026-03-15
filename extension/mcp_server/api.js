@@ -2759,29 +2759,37 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (found.error) return found;
               const { msgHdr } = found;
 
+              const VALID_DISPLAY_MODES = ["3pane", "tab", "window"];
+              const mode = displayMode || "3pane";
+              if (!VALID_DISPLAY_MODES.includes(mode)) {
+                return { error: `Invalid displayMode: "${mode}". Must be one of: ${VALID_DISPLAY_MODES.join(", ")}` };
+              }
+
               const win = Services.wm.getMostRecentWindow("mail:3pane");
               if (!win) return { error: "No Thunderbird mail window found" };
 
-              const { MailUtils } = ChromeUtils.importESModule(
-                "resource:///modules/MailUtils.sys.mjs"
-              );
+              try {
+                const { MailUtils } = ChromeUtils.importESModule(
+                  "resource:///modules/MailUtils.sys.mjs"
+                );
 
-              const mode = displayMode || "3pane";
-              switch (mode) {
-                case "tab": {
-                  const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
-                  const tabmail = win.document.getElementById("tabmail");
-                  if (!tabmail) return { error: "Could not access tabmail interface" };
-                  tabmail.openTab("mailMessageTab", { messageURI: msgUri, msgHdr });
-                  break;
+                switch (mode) {
+                  case "tab": {
+                    const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
+                    const tabmail = win.document.getElementById("tabmail");
+                    if (!tabmail) return { error: "Could not access tabmail interface" };
+                    tabmail.openTab("mailMessageTab", { messageURI: msgUri, msgHdr });
+                    break;
+                  }
+                  case "window":
+                    MailUtils.openMessageInNewWindow(msgHdr);
+                    break;
+                  case "3pane":
+                    MailUtils.displayMessageInFolderTab(msgHdr);
+                    break;
                 }
-                case "window":
-                  MailUtils.openMessageInNewWindow(msgHdr);
-                  break;
-                case "3pane":
-                default:
-                  MailUtils.displayMessageInFolderTab(msgHdr);
-                  break;
+              } catch (e) {
+                return { error: `Failed to display message: ${e.message || e}` };
               }
 
               return { success: true, displayMode: mode, subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "" };
@@ -3032,9 +3040,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 if (addTags || removeTags) {
-                  // Validate: reject tags with whitespace (IMAP keywords are space-delimited)
-                  const tagsToAdd = (addTags || []).filter(t => typeof t === "string" && t && !/\s/.test(t));
-                  const tagsToRemove = (removeTags || []).filter(t => typeof t === "string" && t && !/\s/.test(t));
+                  // Validate: only allow safe IMAP keyword characters (RFC 3501 atom chars)
+                  // Blocks whitespace, null bytes, parens, braces, wildcards, quotes, backslash
+                  const VALID_TAG = /^[a-zA-Z0-9_$.\-]+$/;
+                  const tagsToAdd = (addTags || []).filter(t => typeof t === "string" && VALID_TAG.test(t));
+                  const tagsToRemove = (removeTags || []).filter(t => typeof t === "string" && VALID_TAG.test(t));
                   // Use folder-level keyword APIs for proper IMAP sync
                   if (tagsToAdd.length > 0) {
                     folder.addKeywordsToMessages(foundHdrs, tagsToAdd.join(" "));
