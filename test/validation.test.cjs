@@ -182,6 +182,10 @@ const sampleTools = [
       required: ["folderPath"],
     },
   },
+  {
+    name: "getAccountAccess",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
 ];
 
 const validate = createValidator(sampleTools);
@@ -400,6 +404,19 @@ describe('Validation: contact write operations', () => {
       contactId: 'uid-456',
       force: true,
     });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
+  });
+});
+
+describe('Validation: account access control', () => {
+  it('getAccountAccess accepts no params', () => {
+    const errors = validate('getAccountAccess', {});
+    assert.equal(errors.length, 0);
+  });
+
+  it('getAccountAccess rejects unknown params', () => {
+    const errors = validate('getAccountAccess', { bogus: 'value' });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /Unknown parameter/);
   });

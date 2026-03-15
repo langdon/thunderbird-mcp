@@ -18,7 +18,8 @@ const resProto = Cc[
   "@mozilla.org/network/protocol;1?name=resource"
 ].getService(Ci.nsISubstitutingProtocolHandler);
 
-const MCP_PORT = 8765;
+const MCP_DEFAULT_PORT = 8765;
+const MCP_MAX_PORT_ATTEMPTS = 10;
 // Keep references to active attach timers to prevent GC before they fire.
 const _attachTimers = new Set();
 // Track temp files created for inline base64 attachments (cleaned up on shutdown).
@@ -28,6 +29,7 @@ let _tempFileCounter = 0;
 // Delay before injecting attachments into a newly opened compose window.
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
+const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 1000;
 // Internal IMAP/Thunderbird keywords that should not appear as user-visible tags
@@ -521,6 +523,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["accountId", "folderPath"],
         },
       },
+      {
+        name: "getAccountAccess",
+        title: "Get Account Access",
+        description: "Get the current account access control list. Shows which accounts the MCP server can access. Account access is configured by the user in the extension settings page (Tools > Add-ons > Thunderbird MCP > Options) and cannot be changed via MCP tools.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
     ];
 
     return {
@@ -532,6 +540,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           }
           const startPromise = (async () => {
           try {
+            // Stop any previously running server (e.g. extension reload)
+            if (globalThis.__tbMcpServer) {
+              try { globalThis.__tbMcpServer.stop(() => {}); } catch { /* ignore */ }
+              globalThis.__tbMcpServer = null;
+            }
             const { HttpServer } = ChromeUtils.importESModule(
               "resource://thunderbird-mcp/httpd.sys.mjs?" + Date.now()
             );
@@ -571,14 +584,154 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return NetUtil.readInputStreamToString(stream, stream.available(), { charset: "UTF-8" });
             }
 
-
+            /**
+             * Generate a cryptographically random auth token (hex string).
+             * Used to authenticate bridge requests to the HTTP server.
+             */
+            function generateAuthToken() {
+              const bytes = new Uint8Array(32);
+              // crypto.getRandomValues is not available in Thunderbird experiment API scope;
+              // use the XPCOM random generator instead.
+              const rng = Cc["@mozilla.org/security/random-generator;1"]
+                .createInstance(Ci.nsIRandomGenerator);
+              const randomBytes = rng.generateRandomBytes(32);
+              for (let i = 0; i < 32; i++) bytes[i] = randomBytes[i];
+              return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+            }
 
             /**
-             * Lists all email accounts and their identities.
+             * Write connection info (port + auth token) to a well-known file
+             * so the bridge can discover how to connect.
+             * File: <TmpD>/thunderbird-mcp/connection.json
              */
+            function writeConnectionInfo(port, token) {
+              const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+              tmpDir.append("thunderbird-mcp");
+              if (!tmpDir.exists()) {
+                tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+              }
+              const connFile = tmpDir.clone();
+              connFile.append("connection.json");
+              // Symlink defense: remove any existing file first, then create
+              // with O_CREAT|O_EXCL (0x08|0x80) to fail if a symlink appeared
+              // between remove and create.
+              if (connFile.exists()) {
+                connFile.remove(false);
+              }
+              const data = JSON.stringify({ port, token, pid: Services.appinfo.processID });
+              const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                .createInstance(Ci.nsIFileOutputStream);
+              // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x80 = O_EXCL
+              ostream.init(connFile, 0x02 | 0x08 | 0x80, 0o600, 0);
+              const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
+                .createInstance(Ci.nsIConverterOutputStream);
+              converter.init(ostream, "UTF-8");
+              converter.writeString(data);
+              converter.close();
+              return connFile.path;
+            }
+
+            /**
+             * Remove the connection info file on shutdown.
+             */
+            function removeConnectionInfo() {
+              try {
+                const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+                tmpDir.append("thunderbird-mcp");
+                const connFile = tmpDir.clone();
+                connFile.append("connection.json");
+                if (connFile.exists()) {
+                  connFile.remove(false);
+                }
+              } catch {
+                // Best-effort cleanup
+              }
+            }
+
+            const authToken = generateAuthToken();
+
+            /**
+             * Constant-time string comparison to prevent timing side-channel attacks.
+             */
+            function timingSafeEqual(a, b) {
+              const aStr = String(a);
+              const bStr = String(b);
+              const len = Math.max(aStr.length, bStr.length);
+              let result = aStr.length ^ bStr.length;
+              for (let i = 0; i < len; i++) {
+                result |= (aStr.charCodeAt(i) || 0) ^ (bStr.charCodeAt(i) || 0);
+              }
+              return result === 0;
+            }
+
+            /**
+             * Get the list of allowed account IDs from preferences.
+             * Returns an empty array if no restriction is set (all accounts allowed).
+             */
+            function getAllowedAccountIds() {
+              try {
+                const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
+                if (!pref) return [];
+                const parsed = JSON.parse(pref);
+                if (!Array.isArray(parsed)) {
+                  console.error("thunderbird-mcp: allowed accounts pref is not an array, blocking all accounts");
+                  return ["__invalid__"];
+                }
+                return parsed;
+              } catch (e) {
+                // Fail closed: corrupt pref means block all accounts, not allow all
+                console.error("thunderbird-mcp: failed to parse allowed accounts pref, blocking all accounts:", e);
+                return ["__invalid__"];
+              }
+            }
+
+            /**
+             * Check if an account is accessible based on the allowed accounts list.
+             * When the list is empty, all accounts are accessible (default).
+             */
+            function isAccountAllowed(accountKey) {
+              const allowed = getAllowedAccountIds();
+              if (allowed.length === 0) return true;
+              return allowed.includes(accountKey);
+            }
+
+            /**
+             * Check if a resolved folder belongs to an allowed account.
+             * Returns true if the folder's account is accessible, false otherwise.
+             */
+            function isFolderAccessible(folder) {
+              if (!folder || !folder.server) return false;
+              const account = MailServices.accounts.findAccountForServer(folder.server);
+              return account ? isAccountAllowed(account.key) : false;
+            }
+
+            /**
+             * Lookup a folder by URI and verify it exists and is accessible.
+             * Returns { folder } on success, or { error } if not found or restricted.
+             */
+            function getAccessibleFolder(folderPath) {
+              const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+              if (!folder) return { error: `Folder not found: ${folderPath}` };
+              if (!isFolderAccessible(folder)) return { error: `Account not accessible for folder: ${folderPath}` };
+              return { folder };
+            }
+
+            /**
+             * Get all accessible Thunderbird accounts, filtered by allowed list.
+             */
+            function getAccessibleAccounts() {
+              const result = [];
+              for (const account of MailServices.accounts.accounts) {
+                if (isAccountAllowed(account.key)) {
+                  result.push(account);
+                }
+              }
+              return result;
+            }
+
             function listAccounts() {
               const accounts = [];
-              for (const account of MailServices.accounts.accounts) {
+              for (const account of getAccessibleAccounts()) {
                 const server = account.incomingServer;
                 const identities = [];
                 for (const identity of account.identities) {
@@ -597,6 +750,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 });
               }
               return accounts;
+            }
+
+            /**
+             * Get the current account access control list.
+             */
+            function getAccountAccess() {
+              const allowed = getAllowedAccountIds();
+              // Only return accessible accounts — restricted accounts are hidden
+              const accessibleAccounts = [];
+              for (const account of MailServices.accounts.accounts) {
+                if (!isAccountAllowed(account.key)) continue;
+                const server = account.incomingServer;
+                accessibleAccounts.push({
+                  id: account.key,
+                  name: server.prettyName,
+                  type: server.type,
+                });
+              }
+              return {
+                mode: allowed.length === 0 ? "all" : "restricted",
+                accounts: accessibleAccounts,
+              };
             }
 
             /**
@@ -650,10 +825,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               // folderPath filter: list that folder and its subtree
               if (folderPath) {
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
+                const result = getAccessibleFolder(folderPath);
+                if (result.error) return result;
+                const folder = result.folder;
                 const accountKey = folder.server
                   ? (MailServices.accounts.findAccountForServer(folder.server)?.key || "unknown")
                   : "unknown";
@@ -662,6 +836,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               if (accountId) {
+                if (!isAccountAllowed(accountId)) {
+                  return { error: `Account not accessible: ${accountId}` };
+                }
                 let target = null;
                 for (const account of MailServices.accounts.accounts) {
                   if (account.key === accountId) {
@@ -685,7 +862,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return results;
               }
 
-              for (const account of MailServices.accounts.accounts) {
+              for (const account of getAccessibleAccounts()) {
                 try {
                   const root = account.incomingServer.rootFolder;
                   if (!root) continue;
@@ -709,7 +886,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function findIdentity(emailOrId) {
               if (!emailOrId) return null;
               const lowerInput = emailOrId.toLowerCase();
-              for (const account of MailServices.accounts.accounts) {
+              for (const account of getAccessibleAccounts()) {
                 for (const identity of account.identities) {
                   if (identity.key === emailOrId || (identity.email || "").toLowerCase() === lowerInput) {
                     return identity;
@@ -800,7 +977,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
                     }
                     const tmpFile = tmpDir.clone();
-                    const safeName = (entry.name || entry.filename || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
+                    let safeName = (entry.name || entry.filename || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
+                    if (!safeName || safeName === "." || safeName === "..") safeName = "attachment";
                     tmpFile.append(`${Date.now()}_${++_tempFileCounter}_${safeName}`);
                     // Write via XPCOM binary stream
                     const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
@@ -976,22 +1154,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Sets compose identity from `from` param or falls back to default.
              * Returns warning string if `from` was specified but not found.
              */
-	            function setComposeIdentity(msgComposeParams, from, fallbackServer) {
-	              const identity = findIdentity(from);
-	              if (identity) {
-	                msgComposeParams.identity = identity;
-	                return "";
-	              }
+            function setComposeIdentity(msgComposeParams, from, fallbackServer) {
+              const identity = findIdentity(from);
+              if (identity) {
+                // Verify the identity's account is accessible
+                for (const account of MailServices.accounts.accounts) {
+                  const identities = account.identities;
+                  for (let i = 0; i < identities.length; i++) {
+                    if (identities[i].key === identity.key) {
+                      if (!isAccountAllowed(account.key)) {
+                        return `identity ${from} belongs to restricted account, using default`;
+                      }
+                      break;
+                    }
+                  }
+                }
+                msgComposeParams.identity = identity;
+                return "";
+              }
               // Fallback to default identity for the account
               if (fallbackServer) {
                 const account = MailServices.accounts.findAccountForServer(fallbackServer);
-                if (account) msgComposeParams.identity = account.defaultIdentity;
+                if (account && isAccountAllowed(account.key)) {
+                  msgComposeParams.identity = account.defaultIdentity;
+                }
               } else {
                 const defaultAccount = MailServices.accounts.defaultAccount;
-                if (defaultAccount) msgComposeParams.identity = defaultAccount.defaultIdentity;
+                if (defaultAccount && isAccountAllowed(defaultAccount.key)) {
+                  msgComposeParams.identity = defaultAccount.defaultIdentity;
+                }
               }
-	              return from ? `unknown identity: ${from}, using default` : "";
-	            }
+              return from ? `unknown identity: ${from}, using default` : "";
+            }
 
 	            /**
 	             * Opens a folder and its message database.
@@ -1000,10 +1194,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	             */
 	            function openFolder(folderPath) {
 	              try {
-	                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-	                if (!folder) {
-	                  return { error: `Folder not found: ${folderPath}` };
-	                }
+	                const result = getAccessibleFolder(folderPath);
+	                if (result.error) return result;
+	                const folder = result.folder;
 
 	                // Attempt to refresh IMAP folders. This is async and may not
 	                // complete before we read, but helps with stale data.
@@ -1186,13 +1379,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               if (folderPath) {
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
-                searchFolder(folder);
+                const result = getAccessibleFolder(folderPath);
+                if (result.error) return result;
+                searchFolder(result.folder);
               } else {
-                for (const account of MailServices.accounts.accounts) {
+                for (const account of getAccessibleAccounts()) {
                   if (results.length >= SEARCH_COLLECTION_CAP) break;
                   searchFolder(account.incomingServer.rootFolder);
                 }
@@ -2403,8 +2594,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (opened.error) return { error: opened.error };
                 collectFromFolder(opened.folder);
               } else {
-                // All folders across all accounts
-                for (const account of MailServices.accounts.accounts) {
+                // All folders across accessible accounts
+                for (const account of getAccessibleAccounts()) {
                   if (results.length >= SEARCH_COLLECTION_CAP) break;
                   try {
                     const root = account.incomingServer.rootFolder;
@@ -2607,10 +2798,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return { error: "Trash folder not found" };
                   }
                 } else if (moveTo) {
-                  targetFolder = MailServices.folderLookup.getFolderForURL(moveTo);
-                  if (!targetFolder) {
-                    return { error: `Folder not found: ${moveTo}` };
-                  }
+                  const moveResult = getAccessibleFolder(moveTo);
+                  if (moveResult.error) return moveResult;
+                  targetFolder = moveResult.folder;
                 }
 
                 if (targetFolder) {
@@ -2635,10 +2825,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "name must be a non-empty string" };
                 }
 
-                const parent = MailServices.folderLookup.getFolderForURL(parentFolderPath);
-                if (!parent) {
-                  return { error: `Parent folder not found: ${parentFolderPath}` };
-                }
+                const parentResult = getAccessibleFolder(parentFolderPath);
+                if (parentResult.error) return parentResult;
+                const parent = parentResult.folder;
 
                 parent.createSubfolder(name, null);
 
@@ -2680,10 +2869,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "newName must be a non-empty string" };
                 }
 
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
+                const renameResult = getAccessibleFolder(folderPath);
+                if (renameResult.error) return renameResult;
+                const folder = renameResult.folder;
 
                 folder.rename(newName, null);
                 return {
@@ -2702,10 +2890,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "folderPath must be a non-empty string" };
                 }
 
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
+                const delResult = getAccessibleFolder(folderPath);
+                if (delResult.error) return delResult;
+                const folder = delResult.folder;
                 const folderName = folder.prettyName || folder.name || folderPath;
 
                 const parent = folder.parent;
@@ -2755,16 +2942,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "newParentPath must be a non-empty string" };
                 }
 
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
+                const srcResult = getAccessibleFolder(folderPath);
+                if (srcResult.error) return srcResult;
+                const folder = srcResult.folder;
                 const folderName = folder.prettyName || folder.name || folderPath;
 
-                const newParent = MailServices.folderLookup.getFolderForURL(newParentPath);
-                if (!newParent) {
-                  return { error: `Destination folder not found: ${newParentPath}` };
-                }
+                const destResult = getAccessibleFolder(newParentPath);
+                if (destResult.error) return destResult;
+                const newParent = destResult.folder;
                 const parentName = newParent.prettyName || newParent.name || newParentPath;
 
                 if (folder.parent && folder.parent.URI === newParentPath) {
@@ -2811,6 +2996,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
 
             function getFilterListForAccount(accountId) {
+              if (!isAccountAllowed(accountId)) {
+                return { error: `Account not accessible: ${accountId}` };
+              }
               const account = MailServices.accounts.getAccount(accountId);
               if (!account) return { error: `Account not found: ${accountId}` };
               const server = account.incomingServer;
@@ -2931,11 +3119,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const results = [];
                 let accounts;
                 if (accountId) {
+                  if (!isAccountAllowed(accountId)) {
+                    return { error: `Account not accessible: ${accountId}` };
+                  }
                   const account = MailServices.accounts.getAccount(accountId);
                   if (!account) return { error: `Account not found: ${accountId}` };
                   accounts = [account];
                 } else {
-                  accounts = Array.from(MailServices.accounts.accounts);
+                  accounts = Array.from(getAccessibleAccounts());
                 }
 
                 for (const account of accounts) {
@@ -3202,8 +3393,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (fl.error) return fl;
                 const { filterList } = fl;
 
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) return { error: `Folder not found: ${folderPath}` };
+                const afResult = getAccessibleFolder(folderPath);
+                if (afResult.error) return afResult;
+                const folder = afResult.folder;
 
                 // Try MailServices.filters first, fall back to XPCOM contract ID
                 let filterService;
@@ -3301,6 +3493,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return reorderFilters(args.accountId, args.fromIndex, args.toIndex);
                 case "applyFilters":
                   return applyFilters(args.accountId, args.folderPath);
+                case "getAccountAccess":
+                  return getAccountAccess();
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
@@ -3318,6 +3512,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   jsonrpc: "2.0",
                   id: null,
                   error: { code: -32600, message: "Invalid Request" }
+                }));
+                res.finish();
+                return;
+              }
+
+              // Verify auth token from Authorization header
+              let reqToken = "";
+              try {
+                reqToken = req.getHeader("Authorization") || "";
+              } catch {
+                // getHeader throws if header is missing in httpd.sys.mjs
+              }
+              if (!timingSafeEqual(reqToken, `Bearer ${authToken}`)) {
+                res.setStatusLine("1.1", 403, "Forbidden");
+                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                res.write(JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32600, message: "Invalid or missing auth token" }
                 }));
                 res.finish();
                 return;
@@ -3418,24 +3631,174 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               })();
             });
 
-            server.start(MCP_PORT);
-            console.log(`Thunderbird MCP server listening on port ${MCP_PORT}`);
-            return { success: true, port: MCP_PORT };
+            // Try the default port first, then fall back to nearby ports
+            let boundPort = null;
+            for (let attempt = 0; attempt < MCP_MAX_PORT_ATTEMPTS; attempt++) {
+              const tryPort = MCP_DEFAULT_PORT + attempt;
+              try {
+                server.start(tryPort);
+                boundPort = tryPort;
+                break;
+              } catch (portErr) {
+                if (attempt === MCP_MAX_PORT_ATTEMPTS - 1) {
+                  throw new Error(`Could not bind to any port in range ${MCP_DEFAULT_PORT}-${tryPort}: ${portErr}`);
+                }
+                console.warn(`Port ${tryPort} in use, trying ${tryPort + 1}...`);
+              }
+            }
+
+            const connFilePath = writeConnectionInfo(boundPort, authToken);
+            globalThis.__tbMcpServer = server;
+            console.log(`Thunderbird MCP server listening on port ${boundPort}`);
+            console.log(`Connection info written to ${connFilePath}`);
+            return { success: true, port: boundPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
             // Clear cached promise so a retry can attempt to bind again
             globalThis.__tbMcpStartPromise = null;
+            removeConnectionInfo();
             return { success: false, error: e.toString() };
           }
           })();
+          // Set sentinel BEFORE awaiting to prevent race with concurrent start() calls
           globalThis.__tbMcpStartPromise = startPromise;
           return await startPromise;
-        }
+        },
+
+        getServerInfo: async function() {
+          let port = null;
+          let connectionFile = null;
+          let buildCommit = null;
+          let buildDate = null;
+
+          // Read build info from bundled file via resource: protocol
+          try {
+            const uri = Services.io.newURI("resource://thunderbird-mcp/buildinfo.json");
+            const channel = Services.io.newChannelFromURI(uri, null,
+              Services.scriptSecurityManager.getSystemPrincipal(), null,
+              Ci.nsILoadInfo.SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+              Ci.nsIContentPolicy.TYPE_OTHER);
+            const sis = Cc["@mozilla.org/scriptableinputstream;1"]
+              .createInstance(Ci.nsIScriptableInputStream);
+            sis.init(channel.open());
+            const text = sis.read(sis.available());
+            sis.close();
+            const bi = JSON.parse(text);
+            buildCommit = bi.commit || null;
+            buildDate = bi.builtAt || null;
+          } catch { /* build info not available */ }
+
+          // Read connection info from temp file using XPCOM file I/O
+          try {
+            const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+            tmpDir.append("thunderbird-mcp");
+            const connFile = tmpDir.clone();
+            connFile.append("connection.json");
+            connectionFile = connFile.path;
+            if (connFile.exists()) {
+              const fis = Cc["@mozilla.org/network/file-input-stream;1"]
+                .createInstance(Ci.nsIFileInputStream);
+              fis.init(connFile, 0x01, 0, 0);
+              const sis = Cc["@mozilla.org/scriptableinputstream;1"]
+                .createInstance(Ci.nsIScriptableInputStream);
+              sis.init(fis);
+              const text = sis.read(sis.available());
+              sis.close();
+              const data = JSON.parse(text);
+              port = data.port || null;
+            }
+          } catch { /* ignore */ }
+
+          return {
+            running: !!globalThis.__tbMcpStartPromise,
+            port,
+            connectionFile,
+            buildCommit,
+            buildDate,
+          };
+        },
+
+        getAccountAccessConfig: async function() {
+          const { MailServices } = ChromeUtils.importESModule(
+            "resource:///modules/MailServices.sys.mjs"
+          );
+          let allowed = [];
+          try {
+            const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
+            if (pref) allowed = JSON.parse(pref);
+          } catch { /* ignore */ }
+
+          const accounts = [];
+          for (const account of MailServices.accounts.accounts) {
+            const server = account.incomingServer;
+            accounts.push({
+              id: account.key,
+              name: server.prettyName,
+              type: server.type,
+              allowed: allowed.length === 0 || allowed.includes(account.key),
+            });
+          }
+          return {
+            mode: allowed.length === 0 ? "all" : "restricted",
+            allowedAccountIds: allowed,
+            accounts,
+          };
+        },
+
+        setAccountAccess: async function(allowedAccountIds) {
+          if (!Array.isArray(allowedAccountIds)) {
+            return { error: "allowedAccountIds must be an array" };
+          }
+          const { MailServices } = ChromeUtils.importESModule(
+            "resource:///modules/MailServices.sys.mjs"
+          );
+          const validIds = new Set();
+          for (const account of MailServices.accounts.accounts) {
+            validIds.add(account.key);
+          }
+          const invalid = allowedAccountIds.filter(id => !validIds.has(id));
+          if (invalid.length > 0) {
+            return { error: `Unknown account IDs: ${invalid.join(", ")}` };
+          }
+
+          if (allowedAccountIds.length === 0) {
+            try { Services.prefs.clearUserPref(PREF_ALLOWED_ACCOUNTS); } catch { /* ignore */ }
+          } else {
+            Services.prefs.setStringPref(PREF_ALLOWED_ACCOUNTS, JSON.stringify(allowedAccountIds));
+          }
+          return {
+            success: true,
+            mode: allowedAccountIds.length === 0 ? "all" : "restricted",
+            allowedAccountIds,
+          };
+        },
       }
     };
   }
 
   onShutdown(isAppShutdown) {
+    // Stop the HTTP server so the port is released
+    if (globalThis.__tbMcpServer) {
+      try { globalThis.__tbMcpServer.stop(() => {}); } catch { /* ignore */ }
+      globalThis.__tbMcpServer = null;
+    }
+    // Clear the start promise so a fresh start can occur on reload
+    globalThis.__tbMcpStartPromise = null;
+
+    // Always clean up the connection info file so stale tokens don't linger
+    // (Inlined here because removeConnectionInfo() is scoped inside start())
+    try {
+      const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+      tmpDir.append("thunderbird-mcp");
+      const connFile = tmpDir.clone();
+      connFile.append("connection.json");
+      if (connFile.exists()) {
+        connFile.remove(false);
+      }
+    } catch {
+      // Best-effort cleanup
+    }
+
     // Always clean up temp attachment files (even on app shutdown) to avoid
     // leaving sensitive decoded attachments on disk.
     for (const tmpPath of _tempAttachFiles) {

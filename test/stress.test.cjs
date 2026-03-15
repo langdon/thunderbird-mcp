@@ -435,3 +435,38 @@ describe('Contact write: validation edge cases', () => {
     assert.equal(errors.length, 0);
   });
 });
+
+// ─── Account access control stress tests ──────────────────────────
+
+describe('Account access: validation edge cases', () => {
+  const accessTools = [
+    {
+      name: "getAccountAccess",
+      inputSchema: { type: "object", properties: {}, required: [] },
+    },
+  ];
+  const accessValidate = createValidator(accessTools);
+
+  it('rejects unknown parameters on getAccountAccess', () => {
+    const errors = accessValidate('getAccountAccess', {
+      admin: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: admin/);
+  });
+
+  it('rejects multiple unknown parameters on getAccountAccess', () => {
+    const errors = accessValidate('getAccountAccess', {
+      admin: true,
+      inject: 'malicious',
+    });
+    assert.equal(errors.length, 2);
+  });
+
+  it('handles prototype pollution on getAccountAccess', () => {
+    const malicious = Object.create(null);
+    malicious.constructor = 'attack';
+    const errors = accessValidate('getAccountAccess', malicious);
+    assert.ok(errors.some(e => e.includes('Unknown parameter: constructor')));
+  });
+});
