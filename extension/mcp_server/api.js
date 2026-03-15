@@ -31,19 +31,11 @@ const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
-// All MCP tool names (single source of truth for tools array + settings UI)
-const ALL_TOOL_NAMES = [
-  "listAccounts", "listFolders", "searchMessages", "getMessage",
-  "sendMail", "replyToMessage", "forwardMessage", "deleteMessages",
-  "updateMessage", "getRecentMessages", "displayMessage",
-  "createFolder", "renameFolder",
-  "deleteFolder", "emptyTrash", "emptyJunk", "moveFolder",
-  "searchContacts", "createContact", "updateContact", "deleteContact",
-  "listCalendars", "createEvent", "listEvents", "updateEvent",
-  "deleteEvent", "createTask", "listFilters", "createFilter",
-  "updateFilter", "deleteFilter", "reorderFilters", "applyFilters",
-  "getAccountAccess",
-];
+// Valid group and CRUD values for tool metadata validation
+const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
+const VALID_CRUD = ["create", "read", "update", "delete"];
+// CRUD sort order: read first, then create, update, delete (safe → destructive)
+const CRUD_ORDER = { read: 0, create: 1, update: 2, delete: 3 };
 // Tools that cannot be disabled via the settings page (infrastructure tools)
 const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccess"]);
 const MAX_SEARCH_RESULTS_CAP = 200;
@@ -70,12 +62,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     const tools = [
       {
         name: "listAccounts",
+        group: "system", crud: "read",
         title: "List Accounts",
         description: "List all email accounts and their identities",
         inputSchema: { type: "object", properties: {}, required: [] },
       },
       {
         name: "listFolders",
+        group: "system", crud: "read",
         title: "List Folders",
         description: "List all mail folders with URIs and message counts",
         inputSchema: {
@@ -89,6 +83,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "searchMessages",
+        group: "messages", crud: "read",
         title: "Search Mail",
         description: "Search message headers and return IDs/folder paths you can use with getMessage to read full email content",
         inputSchema: {
@@ -112,6 +107,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "getMessage",
+        group: "messages", crud: "read",
         title: "Get Message",
         description: "Read the full content of an email message by its ID",
         inputSchema: {
@@ -126,6 +122,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "sendMail",
+        group: "messages", crud: "create",
         title: "Compose Mail",
         description: "Compose a new email. Opens a compose window with pre-filled recipient, subject, and body for user review before sending.",
         inputSchema: {
@@ -145,12 +142,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "listCalendars",
+        group: "calendar", crud: "read",
         title: "List Calendars",
         description: "Return the user's calendars",
         inputSchema: { type: "object", properties: {}, required: [] },
       },
       {
         name: "createEvent",
+        group: "calendar", crud: "create",
         title: "Create Event",
         description: "Create a calendar event. By default opens a review dialog; set skipReview to add directly.",
         inputSchema: {
@@ -170,6 +169,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "listEvents",
+        group: "calendar", crud: "read",
         title: "List Events",
         description: "List calendar events within a date range",
         inputSchema: {
@@ -185,6 +185,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "updateEvent",
+        group: "calendar", crud: "update",
         title: "Update Event",
         description: "Update an existing calendar event's title, dates, location, or description",
         inputSchema: {
@@ -203,6 +204,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "deleteEvent",
+        group: "calendar", crud: "delete",
         title: "Delete Event",
         description: "Delete a calendar event",
         inputSchema: {
@@ -216,6 +218,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "createTask",
+        group: "calendar", crud: "create",
         title: "Create Task",
         description: "Open a pre-filled task dialog in Thunderbird for user review before saving",
         inputSchema: {
@@ -230,6 +233,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "searchContacts",
+        group: "contacts", crud: "read",
         title: "Search Contacts",
         description: "Search contacts across all address books by email address or name",
         inputSchema: {
@@ -243,6 +247,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "createContact",
+        group: "contacts", crud: "create",
         title: "Create Contact",
         description: "Create a new contact in an address book",
         inputSchema: {
@@ -259,6 +264,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "updateContact",
+        group: "contacts", crud: "update",
         title: "Update Contact",
         description: "Update an existing contact's properties",
         inputSchema: {
@@ -275,6 +281,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "deleteContact",
+        group: "contacts", crud: "delete",
         title: "Delete Contact",
         description: "Delete a contact from its address book",
         inputSchema: {
@@ -287,6 +294,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "replyToMessage",
+        group: "messages", crud: "create",
         title: "Reply to Message",
         description: "Reply to a message. Opens a compose window with quoted original text and proper threading headers for user review before sending.",
         inputSchema: {
@@ -308,6 +316,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "forwardMessage",
+        group: "messages", crud: "create",
         title: "Forward Message",
         description: "Forward a message. Opens a compose window with the original message content and attachments for user review before sending.",
         inputSchema: {
@@ -328,6 +337,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "getRecentMessages",
+        group: "messages", crud: "read",
         title: "Get Recent Messages",
         description: "Get recent messages sorted newest-first from a specific folder or all Inboxes, with date and unread filtering",
         inputSchema: {
@@ -346,6 +356,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "displayMessage",
+        group: "messages", crud: "read",
         title: "Display Message",
         description: "Open or navigate to a message in the Thunderbird GUI. Use '3pane' (default) to select the message in the mail view, 'tab' to open in a new tab, or 'window' to open in a standalone window.",
         inputSchema: {
@@ -360,6 +371,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "deleteMessages",
+        group: "messages", crud: "delete",
         title: "Delete Messages",
         description: "Delete messages from a folder. Drafts are moved to Trash instead of permanently deleted.",
         inputSchema: {
@@ -373,6 +385,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "updateMessage",
+        group: "messages", crud: "update",
         title: "Update Message",
         description: "Update one or more messages' read/flagged/tagged state and optionally move them. Supply messageId for a single message or messageIds for bulk operations. Tags are Thunderbird keywords (e.g. '$label1' for Important, '$label2' for Work, or any custom string). Note: combining tags with moveTo/trash on IMAP may not preserve tags on the moved copy — use separate calls if needed.",
         inputSchema: {
@@ -393,6 +406,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "createFolder",
+        group: "folders", crud: "create",
         title: "Create Folder",
         description: "Create a new mail subfolder under an existing folder. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
         inputSchema: {
@@ -406,6 +420,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "renameFolder",
+        group: "folders", crud: "update",
         title: "Rename Folder",
         description: "Rename an existing mail folder. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
         inputSchema: {
@@ -419,6 +434,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "deleteFolder",
+        group: "folders", crud: "delete",
         title: "Delete Folder",
         description: "Delete a mail folder and all its contents. Moves to Trash, or permanently deletes if already in Trash. Note: permanent deletion may prompt the user for confirmation. On IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
         inputSchema: {
@@ -431,6 +447,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "emptyTrash",
+        group: "folders", crud: "delete",
         title: "Empty Trash",
         description: "Permanently delete all messages in the Trash folder for an account.",
         inputSchema: {
@@ -443,6 +460,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "emptyJunk",
+        group: "folders", crud: "delete",
         title: "Empty Junk",
         description: "Permanently delete all messages in the Junk/Spam folder for an account.",
         inputSchema: {
@@ -455,6 +473,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "moveFolder",
+        group: "folders", crud: "update",
         title: "Move Folder",
         description: "Move a mail folder to a new parent folder within the same account. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
         inputSchema: {
@@ -468,6 +487,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "listFilters",
+        group: "filters", crud: "read",
         title: "List Filters",
         description: "List all mail filters/rules for an account with their conditions and actions",
         inputSchema: {
@@ -480,6 +500,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "createFilter",
+        group: "filters", crud: "create",
         title: "Create Filter",
         description: "Create a new mail filter rule on an account",
         inputSchema: {
@@ -521,6 +542,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "updateFilter",
+        group: "filters", crud: "update",
         title: "Update Filter",
         description: "Modify an existing filter's properties, conditions, or actions",
         inputSchema: {
@@ -545,6 +567,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "deleteFilter",
+        group: "filters", crud: "delete",
         title: "Delete Filter",
         description: "Delete a mail filter by index",
         inputSchema: {
@@ -558,6 +581,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "reorderFilters",
+        group: "filters", crud: "update",
         title: "Reorder Filters",
         description: "Move a filter to a different position in the execution order",
         inputSchema: {
@@ -572,6 +596,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "applyFilters",
+        group: "filters", crud: "update",
         title: "Apply Filters",
         description: "Manually run all enabled filters on a folder to organize existing messages",
         inputSchema: {
@@ -585,11 +610,35 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       {
         name: "getAccountAccess",
+        group: "system", crud: "read",
         title: "Get Account Access",
         description: "Get the current account access control list. Shows which accounts the MCP server can access. Account access is configured by the user in the extension settings page (Tools > Add-ons > Thunderbird MCP > Options) and cannot be changed via MCP tools.",
         inputSchema: { type: "object", properties: {}, required: [] },
       },
     ];
+
+    // Validate tool metadata: every tool must have valid group and crud fields.
+    // This prevents tools from being silently hidden in the settings UI.
+    const toolErrors = [];
+    for (const tool of tools) {
+      if (!tool.group || !VALID_GROUPS.includes(tool.group)) {
+        toolErrors.push(`Tool "${tool.name}" has invalid or missing group: "${tool.group}" (valid: ${VALID_GROUPS.join(", ")})`);
+      }
+      if (!tool.crud || !VALID_CRUD.includes(tool.crud)) {
+        toolErrors.push(`Tool "${tool.name}" has invalid or missing crud: "${tool.crud}" (valid: ${VALID_CRUD.join(", ")})`);
+      }
+    }
+    if (toolErrors.length > 0) {
+      console.error("thunderbird-mcp: Tool metadata validation failed:\n  " + toolErrors.join("\n  "));
+    }
+
+    // Derive ALL_TOOL_NAMES from the tools array (single source of truth)
+    const ALL_TOOL_NAMES = tools.map(t => t.name);
+
+    // Group display order for settings UI
+    const GROUP_ORDER = { system: 0, messages: 1, folders: 2, contacts: 3, calendar: 4, filters: 5 };
+    // Group display labels
+    const GROUP_LABELS = { system: "System", messages: "Messages", folders: "Folders", contacts: "Contacts", calendar: "Calendar", filters: "Filters" };
 
     return {
       mcpServer: {
@@ -4215,14 +4264,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             corrupt = true;
           }
 
-          const toolList = ALL_TOOL_NAMES.map(name => ({
-            name,
-            enabled: corrupt ? UNDISABLEABLE_TOOLS.has(name) : !disabled.includes(name),
-            undisableable: UNDISABLEABLE_TOOLS.has(name),
-          }));
+          // Build tool list with group/crud metadata, sorted by group then CRUD order
+          const toolList = tools
+            .map(t => ({
+              name: t.name,
+              group: t.group,
+              crud: t.crud,
+              enabled: corrupt ? UNDISABLEABLE_TOOLS.has(t.name) : !disabled.includes(t.name),
+              undisableable: UNDISABLEABLE_TOOLS.has(t.name),
+            }))
+            .sort((a, b) => {
+              const gA = GROUP_ORDER[a.group] ?? 99;
+              const gB = GROUP_ORDER[b.group] ?? 99;
+              if (gA !== gB) return gA - gB;
+              return (CRUD_ORDER[a.crud] ?? 99) - (CRUD_ORDER[b.crud] ?? 99);
+            });
           const result = {
             mode: corrupt ? "error" : (disabled.length === 0 ? "all" : "restricted"),
             disabledTools: disabled,
+            groups: GROUP_LABELS,
             tools: toolList,
           };
           if (corrupt) {
