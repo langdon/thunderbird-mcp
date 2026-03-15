@@ -31,6 +31,17 @@ const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
+// All MCP tool names (single source of truth for tools array + settings UI)
+const ALL_TOOL_NAMES = [
+  "listAccounts", "listFolders", "searchMessages", "getMessage",
+  "sendMail", "replyToMessage", "forwardMessage", "deleteMessages",
+  "updateMessage", "getRecentMessages", "createFolder", "renameFolder",
+  "deleteFolder", "moveFolder", "searchContacts", "createContact",
+  "updateContact", "deleteContact", "listCalendars", "createEvent",
+  "listEvents", "updateEvent", "deleteEvent", "createTask",
+  "listFilters", "createFilter", "updateFilter", "deleteFilter",
+  "reorderFilters", "applyFilters", "getAccountAccess",
+];
 // Tools that cannot be disabled via the settings page (infrastructure tools)
 const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccess"]);
 const MAX_SEARCH_RESULTS_CAP = 200;
@@ -754,7 +765,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             /**
              * Check if a tool is enabled.
-             * Undisableable tools (listAccounts, listFolders, getAccountAccessConfig) always return true.
+             * Undisableable tools (listAccounts, listFolders, getAccountAccess) always return true.
              */
             function isToolEnabled(toolName) {
               if (UNDISABLEABLE_TOOLS.has(toolName)) return true;
@@ -3933,52 +3944,56 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         getToolAccessConfig: async function() {
+          // Use same fail-closed parsing as getDisabledTools() so the UI
+          // accurately reflects the server's actual state on corrupt prefs
           let disabled = [];
+          let corrupt = false;
           try {
             const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
-            if (pref) disabled = JSON.parse(pref);
-          } catch { /* ignore */ }
+            if (pref) {
+              const parsed = JSON.parse(pref);
+              if (!Array.isArray(parsed)) {
+                corrupt = true;
+              } else {
+                disabled = parsed;
+              }
+            }
+          } catch {
+            corrupt = true;
+          }
 
-          // Build tool list from the tools array defined inside start()
-          // We access it indirectly through the preference state
-          const allToolNames = [
-            "listAccounts", "listFolders", "searchMessages", "getMessage",
-            "sendMail", "replyToMessage", "forwardMessage", "deleteMessages",
-            "updateMessage", "getRecentMessages", "createFolder", "renameFolder",
-            "deleteFolder", "moveFolder", "searchContacts", "createContact",
-            "updateContact", "deleteContact", "listCalendars", "createEvent",
-            "listEvents", "updateEvent", "deleteEvent", "createTask",
-            "listFilters", "createFilter", "updateFilter", "deleteFilter",
-            "reorderFilters", "applyFilters", "getAccountAccess",
-          ];
-          const toolList = allToolNames.map(name => ({
+          const toolList = ALL_TOOL_NAMES.map(name => ({
             name,
-            enabled: !disabled.includes(name),
+            enabled: corrupt ? UNDISABLEABLE_TOOLS.has(name) : !disabled.includes(name),
             undisableable: UNDISABLEABLE_TOOLS.has(name),
           }));
-          return {
-            mode: disabled.length === 0 ? "all" : "restricted",
+          const result = {
+            mode: corrupt ? "error" : (disabled.length === 0 ? "all" : "restricted"),
             disabledTools: disabled,
             tools: toolList,
           };
+          if (corrupt) {
+            result.error = "Disabled tools preference is corrupt. All non-infrastructure tools are blocked. Save to reset.";
+          }
+          return result;
         },
 
         setToolAccess: async function(disabledTools) {
           if (!Array.isArray(disabledTools)) {
             return { error: "disabledTools must be an array" };
           }
-          // Validate: can't disable undisableable tools
-          const blocked = disabledTools.filter(t => UNDISABLEABLE_TOOLS.has(t));
-          if (blocked.length > 0) {
-            return { error: `Cannot disable infrastructure tools: ${blocked.join(", ")}` };
-          }
-          // Validate: all names must be strings
+          // Validate types first, then semantic checks
           if (!disabledTools.every(t => typeof t === "string")) {
             return { error: "All tool names must be strings" };
           }
           // Reject internal sentinel values
           if (disabledTools.includes("__all__")) {
             return { error: "Invalid tool name: __all__" };
+          }
+          // Validate: can't disable undisableable tools
+          const blocked = disabledTools.filter(t => UNDISABLEABLE_TOOLS.has(t));
+          if (blocked.length > 0) {
+            return { error: `Cannot disable infrastructure tools: ${blocked.join(", ")}` };
           }
 
           if (disabledTools.length === 0) {

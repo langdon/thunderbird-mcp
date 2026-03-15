@@ -330,15 +330,16 @@ describe("Tool access: setToolAccess validation", () => {
     if (!Array.isArray(disabledTools)) {
       return { error: "disabledTools must be an array" };
     }
-    const blocked = disabledTools.filter(t => UNDISABLEABLE_TOOLS.has(t));
-    if (blocked.length > 0) {
-      return { error: `Cannot disable infrastructure tools: ${blocked.join(", ")}` };
-    }
+    // Validate types first, then semantic checks
     if (!disabledTools.every(t => typeof t === "string")) {
       return { error: "All tool names must be strings" };
     }
     if (disabledTools.includes("__all__")) {
       return { error: "Invalid tool name: __all__" };
+    }
+    const blocked = disabledTools.filter(t => UNDISABLEABLE_TOOLS.has(t));
+    if (blocked.length > 0) {
+      return { error: `Cannot disable infrastructure tools: ${blocked.join(", ")}` };
     }
     return { success: true };
   }
