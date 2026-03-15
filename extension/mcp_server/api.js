@@ -31,7 +31,7 @@ const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const MAX_SEARCH_RESULTS_CAP = 200;
-const SEARCH_COLLECTION_CAP = 1000;
+const SEARCH_COLLECTION_CAP = 10000;
 // Internal IMAP/Thunderbird keywords that should not appear as user-visible tags
 const INTERNAL_KEYWORDS = new Set([
   "junk", "notjunk", "$forwarded", "$replied",
@@ -81,13 +81,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             query: { type: "string", description: "Text to search in subject, author, or recipients (use empty string to match all)" },
             folderPath: { type: "string", description: "Optional folder URI (from listFolders) to limit search to that folder and its subfolders" },
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
-            endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date" },
+            endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date. Date-only strings (e.g. '2024-01-15') include the full day." },
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
-            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 1000." },
+            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 10000." },
             sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
-            tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." }
+            tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." },
+            includeSubfolders: { type: "boolean", description: "If false, only search the specified folder — not its subfolders. Default: true." },
           },
           required: ["query"],
         },
@@ -109,7 +110,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "sendMail",
         title: "Compose Mail",
-        description: "Open a compose window with pre-filled recipient, subject, and body for user review before sending",
+        description: "Compose a new email. Opens a compose window with pre-filled recipient, subject, and body for user review before sending.",
         inputSchema: {
           type: "object",
           properties: {
@@ -213,11 +214,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "searchContacts",
         title: "Search Contacts",
-        description: "Find contacts the user interacted with",
+        description: "Search contacts across all address books by email address or name",
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Email address or name to search for" }
+            query: { type: "string", description: "Email address or name to search for" },
+            maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200). If truncated, response includes hasMore: true." },
           },
           required: ["query"],
         },
@@ -269,7 +271,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "replyToMessage",
         title: "Reply to Message",
-        description: "Open a reply compose window for a specific message with proper threading",
+        description: "Reply to a message. Opens a compose window with quoted original text and proper threading headers for user review before sending.",
         inputSchema: {
           type: "object",
           properties: {
@@ -290,7 +292,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "forwardMessage",
         title: "Forward Message",
-        description: "Open a forward compose window for a message with attachments preserved",
+        description: "Forward a message. Opens a compose window with the original message content and attachments for user review before sending.",
         inputSchema: {
           type: "object",
           properties: {
@@ -310,16 +312,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "getRecentMessages",
         title: "Get Recent Messages",
-        description: "Get recent messages from a specific folder or all folders, with date and unread filtering",
+        description: "Get recent messages sorted newest-first from a specific folder or all Inboxes, with date and unread filtering",
         inputSchema: {
           type: "object",
           properties: {
             folderPath: { type: "string", description: "Folder URI (from listFolders) to list messages from. If omitted, returns messages from all Inboxes." },
-            daysBack: { type: "number", description: "Only return messages from the last N days (default: 7)" },
+            daysBack: { type: "number", description: "Only return messages from the last N days (default: 7). Use a larger value like 365 for older messages." },
             maxResults: { type: "number", description: "Maximum number of results (default: 50, max: 200)" },
-            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 1000." },
+            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 10000." },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
+            includeSubfolders: { type: "boolean", description: "If false, only return messages from the specified folder — not its subfolders. Default: true." },
           },
           required: [],
         },
@@ -340,7 +343,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "updateMessage",
         title: "Update Message",
-        description: "Update one or more messages' read/flagged/tagged state and optionally move them. Supply messageId for a single message or messageIds for bulk operations. Tags are Thunderbird keywords (e.g. '$label1' for Important, '$label2' for Work, or any custom string).",
+        description: "Update one or more messages' read/flagged/tagged state and optionally move them. Supply messageId for a single message or messageIds for bulk operations. Tags are Thunderbird keywords (e.g. '$label1' for Important, '$label2' for Work, or any custom string). Note: combining tags with moveTo/trash on IMAP may not preserve tags on the moved copy — use separate calls if needed.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1333,15 +1336,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders) {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
 	              const parsedStartDate = startDate ? new Date(startDate).getTime() : NaN;
               const parsedEndDate = endDate ? new Date(endDate).getTime() : NaN;
               const startDateTs = Number.isFinite(parsedStartDate) ? parsedStartDate * 1000 : null;
-              // Add 24h only for date-only strings (no time component) to include the full day
-              const endDateOffset = endDate && !endDate.includes("T") ? 86400000 : 0;
+              // Add 24h only for date-only strings (e.g. "2024-01-15") to include the full day.
+              // Use regex to detect ISO date-only format rather than checking for "T" which
+              // would match arbitrary strings like "Totally invalid".
+              const isDateOnly = endDate && /^\d{4}-\d{2}-\d{2}$/.test(endDate.trim());
+              const endDateOffset = isDateOnly ? 86400000 : 0;
               const endDateTs = Number.isFinite(parsedEndDate) ? (parsedEndDate + endDateOffset) * 1000 : null;
               const requestedLimit = Number(maxResults);
               const effectiveLimit = Math.min(
@@ -1415,7 +1421,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // Skip inaccessible folders
                 }
 
-                if (folder.hasSubFolders) {
+                const recurse = includeSubfolders !== false; // default true
+                if (recurse && folder.hasSubFolders) {
                   for (const subfolder of folder.subFolders) {
                     if (results.length >= SEARCH_COLLECTION_CAP) break;
                     searchFolder(subfolder);
@@ -1439,9 +1446,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return paginate(results, offset, effectiveLimit);
             }
 
-            function searchContacts(query) {
+            function searchContacts(query, maxResults) {
               const results = [];
               const lowerQuery = query.toLowerCase();
+              const requestedLimit = Number(maxResults);
+              const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+                ? Math.min(Math.floor(requestedLimit), MAX_SEARCH_RESULTS_CAP)
+                : DEFAULT_MAX_RESULTS;
+              let truncated = false;
 
               for (const book of MailServices.ab.directories) {
                 for (const card of book.childCards) {
@@ -1466,11 +1478,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     });
                   }
 
-                  if (results.length >= DEFAULT_MAX_RESULTS) break;
+                  if (results.length >= limit) { truncated = true; break; }
                 }
-                if (results.length >= DEFAULT_MAX_RESULTS) break;
+                if (truncated) break;
               }
 
+              if (truncated) {
+                return { contacts: results, hasMore: true, message: `Results limited to ${limit}. Refine your query to see more.` };
+              }
               return results;
             }
 
@@ -1839,12 +1854,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     items = await getCalendarItems(calendar, rangeStart, rangeEnd);
                   }
 
+                  const EVENT_COLLECTION_CAP = limit * 10; // Safety cap for recurring event expansion
                   for (const item of items) {
+                    if (results.length >= EVENT_COLLECTION_CAP) break;
                     // If we got base recurring events (fallback path), expand them
                     if (item.recurrenceInfo) {
                       try {
                         const occurrences = item.recurrenceInfo.getOccurrences(rangeStart, rangeEnd, 0);
                         for (const occ of occurrences) {
+                          if (results.length >= EVENT_COLLECTION_CAP) break;
                           results.push(formatEvent(occ, calendar));
                         }
                       } catch {
@@ -2405,15 +2423,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         // Split on commas not inside quotes to handle "Last, First" <email>
                         const splitAddresses = (s) => (s || "").match(/(?:[^,"]|"[^"]*")+/g) || [];
                         const extractEmail = (s) => (s.match(/<([^>]+)>/)?.[1] || s.trim()).toLowerCase();
-                        // Get own email from the account identity for accurate self-filtering
+                        // Get all own emails (default + aliases) for accurate self-filtering
                         const ownAccount = MailServices.accounts.findAccountForServer(folder.server);
-                        const ownEmail = (ownAccount?.defaultIdentity?.email || "").toLowerCase();
+                        const ownEmails = new Set();
+                        if (ownAccount) {
+                          for (const identity of ownAccount.identities) {
+                            if (identity.email) ownEmails.add(identity.email.toLowerCase());
+                          }
+                        }
                         const allRecipients = [
                           ...splitAddresses(msgHdr.recipients),
                           ...splitAddresses(msgHdr.ccList)
                         ]
                           .map(r => r.trim())
-                          .filter(r => r && (!ownEmail || extractEmail(r) !== ownEmail));
+                          .filter(r => r && (ownEmails.size === 0 || !ownEmails.has(extractEmail(r))));
                         // Deduplicate by email address
                         const seen = new Set();
                         const uniqueRecipients = allRecipients.filter(r => {
@@ -2434,8 +2457,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                       composeFields.bcc = bcc || "";
 
-                      const origSubject = msgHdr.subject || "";
-                      composeFields.subject = origSubject.startsWith("Re:") ? origSubject : `Re: ${origSubject}`;
+                      const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                      composeFields.subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`;
 
                       // Threading headers
                       composeFields.references = `<${messageId}>`;
@@ -2578,7 +2601,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-            function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly) {
+            function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
               const results = [];
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
               const cutoffTs = (Date.now() - days * 86400000) * 1000; // Thunderbird uses microseconds
@@ -2622,7 +2645,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // Skip inaccessible folders
                 }
 
-                if (folder.hasSubFolders) {
+                const recurse = includeSubfolders !== false; // default true
+                if (recurse && folder.hasSubFolders) {
                   for (const subfolder of folder.subFolders) {
                     if (results.length >= SEARCH_COLLECTION_CAP) break;
                     collectFromFolder(subfolder);
@@ -2843,11 +2867,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 if (targetFolder) {
+                  // Note: on IMAP, tags/flags set above may not transfer to the
+                  // moved copy. If both tags and move are needed, consider making
+                  // two separate updateMessage calls (tags first, then move).
                   MailServices.copy.copyMessages(folder, foundHdrs, targetFolder, true, null, null, false);
                   actions.push({ type: "move", to: targetFolder.URI });
                 }
 
                 const result = { success: true, updated: foundHdrs.length, actions };
+                if (targetFolder && (addTags || removeTags)) {
+                  result.warning = "Tags were applied before move; on IMAP accounts, tags may not transfer to the moved copy. Consider separate calls if tags are missing.";
+                }
                 if (notFound.length > 0) result.notFound = notFound;
                 return result;
               } catch (e) {
@@ -3568,11 +3598,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag);
+                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
-                  return searchContacts(args.query || "");
+                  return searchContacts(args.query || "", args.maxResults);
                 case "createContact":
                   return createContact(args.email, args.displayName, args.firstName, args.lastName, args.addressBookId);
                 case "updateContact":
@@ -3598,7 +3628,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
                 case "getRecentMessages":
-                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly);
+                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
