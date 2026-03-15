@@ -18,8 +18,8 @@ let currentAccounts = [];
 let currentTools = [];
 
 const TOOL_GROUPS = [
-  { label: "Messages", tools: ["searchMessages", "getMessage", "getRecentMessages", "sendMail", "replyToMessage", "forwardMessage", "updateMessage", "deleteMessages"] },
-  { label: "Folders", tools: ["createFolder", "renameFolder", "moveFolder", "deleteFolder"] },
+  { label: "Messages", tools: ["searchMessages", "getMessage", "getRecentMessages", "displayMessage", "sendMail", "replyToMessage", "forwardMessage", "updateMessage", "deleteMessages"] },
+  { label: "Folders", tools: ["createFolder", "renameFolder", "moveFolder", "deleteFolder", "emptyTrash", "emptyJunk"] },
   { label: "Contacts", tools: ["searchContacts", "createContact", "updateContact", "deleteContact"] },
   { label: "Calendar", tools: ["listCalendars", "listEvents", "createEvent", "updateEvent", "deleteEvent", "createTask"] },
   { label: "Filters", tools: ["listFilters", "createFilter", "updateFilter", "deleteFilter", "reorderFilters", "applyFilters"] },
@@ -40,9 +40,25 @@ async function loadServerInfo() {
       serverPort.textContent = "--";
       connFile.textContent = "--";
     }
-    if (info.buildCommit) {
-      const date = info.buildDate ? " (" + info.buildDate.replace("T", " ").replace(/\.\d+Z$/, " UTC") + ")" : "";
-      buildInfo.textContent = info.buildCommit + date;
+    if (info.buildVersion) {
+      // Parse git describe: "v0.2.0-7-g1461f1a+dirty" → tag, commits, hash, dirty
+      const m = info.buildVersion.match(/^(v[\d.]+)(?:-(\d+)-g([0-9a-f]+))?(\+dirty)?$/);
+      let display;
+      if (m) {
+        const [, tag, commits, hash, dirty] = m;
+        display = tag;
+        if (commits && commits !== "0") display += ` +${commits}`;
+        display += ` (${hash || tag})`;
+        if (dirty) {
+          display += " +dirty";
+          if (info.buildDate) {
+            display += " " + info.buildDate.replace("T", " ").replace(/\.\d+Z$/, " UTC");
+          }
+        }
+      } else {
+        display = info.buildVersion;
+      }
+      buildInfo.textContent = display;
     } else {
       buildInfo.textContent = "--";
     }
@@ -150,7 +166,17 @@ async function loadToolAccess() {
     }
 
     toolList.innerHTML = "";
-    for (const group of TOOL_GROUPS) {
+
+    // Collect all grouped tool names to detect ungrouped ones
+    const groupedTools = new Set(TOOL_GROUPS.flatMap(g => g.tools));
+
+    // Build the groups to render, appending "Other" if any tools are ungrouped
+    const ungrouped = currentTools.filter(t => !groupedTools.has(t.name)).map(t => t.name);
+    const groups = ungrouped.length > 0
+      ? [...TOOL_GROUPS, { label: "Other", tools: ungrouped }]
+      : TOOL_GROUPS;
+
+    for (const group of groups) {
       // Group header
       const header = document.createElement("li");
       header.className = "tool-group-header";
