@@ -963,6 +963,106 @@ describe('searchContacts: truncation signaling', () => {
   });
 });
 
+// ─── Forward: Fwd: prefix handling ─────────────────────────────────
+
+describe('Forward: Fwd: prefix handling', () => {
+  // OLD (buggy): case-sensitive, used raw subject
+  function addFwdPrefixOld(subject) {
+    return subject.startsWith("Fwd:") ? subject : `Fwd: ${subject}`;
+  }
+
+  // NEW (fixed): case-insensitive regex, uses decoded subject
+  function addFwdPrefixFixed(subject) {
+    return /^fwd:/i.test(subject) ? subject : `Fwd: ${subject}`;
+  }
+
+  it('BUG: old code double-prefixes "FWD: Hello" (uppercase)', () => {
+    assert.equal(addFwdPrefixOld('FWD: Hello'), 'Fwd: FWD: Hello',
+      'Bug confirmed: old code produces double prefix');
+  });
+
+  it('FIX: new code handles "FWD: Hello" correctly', () => {
+    assert.equal(addFwdPrefixFixed('FWD: Hello'), 'FWD: Hello');
+  });
+
+  it('BUG: old code double-prefixes "fwd: Hello" (lowercase)', () => {
+    assert.equal(addFwdPrefixOld('fwd: Hello'), 'Fwd: fwd: Hello',
+      'Bug confirmed: old code produces double prefix');
+  });
+
+  it('FIX: new code handles "fwd: Hello" correctly', () => {
+    assert.equal(addFwdPrefixFixed('fwd: Hello'), 'fwd: Hello');
+  });
+
+  it('FIX: does not double-prefix "Fwd: Hello"', () => {
+    assert.equal(addFwdPrefixFixed('Fwd: Hello'), 'Fwd: Hello');
+  });
+
+  it('FIX: adds prefix to plain subject', () => {
+    assert.equal(addFwdPrefixFixed('Hello'), 'Fwd: Hello');
+  });
+
+  it('FIX: adds prefix to empty subject', () => {
+    assert.equal(addFwdPrefixFixed(''), 'Fwd: ');
+  });
+
+  it('FIX: adds prefix when "fwd" is not at start', () => {
+    assert.equal(addFwdPrefixFixed('About fwd: something'), 'Fwd: About fwd: something');
+  });
+});
+
+// ─── createTask: date-only detection ───────────────────────────────
+
+describe('createTask: date-only detection', () => {
+  // OLD (buggy): checks for "T" anywhere
+  function isDateOnlyOld(dateStr) {
+    return dateStr && !dateStr.includes("T");
+  }
+
+  // NEW (fixed): strict YYYY-MM-DD regex
+  function isDateOnlyFixed(dateStr) {
+    return dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr.trim());
+  }
+
+  it('BUG: old code treats "no time here" as date-only', () => {
+    assert.equal(isDateOnlyOld('no time here'), true,
+      'Bug: string without T is falsely treated as date-only');
+  });
+
+  it('FIX: new code rejects "no time here"', () => {
+    assert.equal(isDateOnlyFixed('no time here'), false);
+  });
+
+  it('BUG: old code treats "Totally invalid" as having time (because of T)', () => {
+    assert.equal(isDateOnlyOld('Totally invalid'), false,
+      'Bug: "T" in string makes it look like a datetime');
+  });
+
+  it('FIX: new code correctly rejects "Totally invalid"', () => {
+    assert.equal(isDateOnlyFixed('Totally invalid'), false);
+  });
+
+  it('FIX: accepts valid date-only "2024-06-15"', () => {
+    assert.equal(isDateOnlyFixed('2024-06-15'), true);
+  });
+
+  it('FIX: rejects datetime "2024-06-15T14:30:00"', () => {
+    assert.equal(isDateOnlyFixed('2024-06-15T14:30:00'), false);
+  });
+
+  it('FIX: handles whitespace-padded date', () => {
+    assert.equal(isDateOnlyFixed('  2024-06-15  '), true);
+  });
+
+  it('FIX: rejects empty string', () => {
+    assert.ok(!isDateOnlyFixed(''));
+  });
+
+  it('FIX: rejects null', () => {
+    assert.ok(!isDateOnlyFixed(null));
+  });
+});
+
 // ─── Validation adversarial tests ─────────────────────────────────
 
 describe('Validation: adversarial and edge-case inputs', () => {

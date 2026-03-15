@@ -30,6 +30,20 @@ let _tempFileCounter = 0;
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
+const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
+// All MCP tool names (single source of truth for tools array + settings UI)
+const ALL_TOOL_NAMES = [
+  "listAccounts", "listFolders", "searchMessages", "getMessage",
+  "sendMail", "replyToMessage", "forwardMessage", "deleteMessages",
+  "updateMessage", "getRecentMessages", "createFolder", "renameFolder",
+  "deleteFolder", "moveFolder", "searchContacts", "createContact",
+  "updateContact", "deleteContact", "listCalendars", "createEvent",
+  "listEvents", "updateEvent", "deleteEvent", "createTask",
+  "listFilters", "createFilter", "updateFilter", "deleteFilter",
+  "reorderFilters", "applyFilters", "getAccountAccess",
+];
+// Tools that cannot be disabled via the settings page (infrastructure tools)
+const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccess"]);
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 10000;
 // Internal IMAP/Thunderbird keywords that should not appear as user-visible tags
@@ -347,9 +361,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            messageId: { type: "string", description: "A single message ID (from searchMessages results). Use messageId or messageIds, not both." },
-            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs for bulk operations. Use messageId or messageIds, not both." },
-            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+            messageId: { type: "string", description: "A single message ID (from searchMessages results). Required unless messageIds is provided." },
+            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs for bulk operations. Required unless messageId is provided." },
+            folderPath: { type: "string", description: "The folder URI containing the message(s) (from searchMessages results)" },
             read: { type: "boolean", description: "Set to true/false to mark read/unread (optional)" },
             flagged: { type: "boolean", description: "Set to true/false to flag/unflag (optional)" },
             addTags: { type: "array", items: { type: "string" }, description: "Tag keywords to add (e.g. ['$label1', 'project-x']). Thunderbird built-in tags: $label1 (Important), $label2 (Work), $label3 (Personal), $label4 (To Do), $label5 (Later)" },
@@ -726,6 +740,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const allowed = getAllowedAccountIds();
               if (allowed.length === 0) return true;
               return allowed.includes(accountKey);
+            }
+
+            /**
+             * Get the list of disabled tool names from preferences.
+             * Returns an empty array if no tools are disabled (all enabled).
+             * Fails closed: corrupt pref disables all tools.
+             */
+            function getDisabledTools() {
+              try {
+                const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
+                if (!pref) return [];
+                const parsed = JSON.parse(pref);
+                if (!Array.isArray(parsed)) {
+                  console.error("thunderbird-mcp: disabled tools pref is not an array, disabling all tools");
+                  return ["__all__"];
+                }
+                return parsed;
+              } catch (e) {
+                console.error("thunderbird-mcp: failed to parse disabled tools pref, disabling all tools:", e);
+                return ["__all__"];
+              }
+            }
+
+            /**
+             * Check if a tool is enabled.
+             * Undisableable tools (listAccounts, listFolders, getAccountAccess) always return true.
+             */
+            function isToolEnabled(toolName) {
+              if (UNDISABLEABLE_TOOLS.has(toolName)) return true;
+              const disabled = getDisabledTools();
+              if (disabled.includes("__all__")) return false;
+              return !disabled.includes(toolName);
             }
 
             /**
@@ -1474,7 +1520,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       email: card.primaryEmail,
                       firstName: card.firstName,
                       lastName: card.lastName,
-                      addressBook: book.dirName
+                      addressBook: book.dirName,
+                      addressBookId: book.URI,
                     });
                   }
 
@@ -2002,8 +2049,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (dueDate) {
                   const js = new Date(dueDate);
                   if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
-                  // Date-only string (no "T") means all-day
-                  if (!dueDate.includes("T")) {
+                  // Date-only string (YYYY-MM-DD) means all-day
+                  if (/^\d{4}-\d{2}-\d{2}$/.test(dueDate.trim())) {
                     dueDt = cal.createDateTime();
                     dueDt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
                     dueDt.isDate = true;
@@ -2535,8 +2582,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       composeFields.cc = cc || "";
                       composeFields.bcc = bcc || "";
 
-                      const origSubject = msgHdr.subject || "";
-                      composeFields.subject = origSubject.startsWith("Fwd:") ? origSubject : `Fwd: ${origSubject}`;
+                      const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                      composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
 
                       // Get original body
                       const originalBody = extractPlainTextBody(aMimeMsg);
@@ -3750,11 +3797,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       result = { prompts: [] };
                       break;
                     case "tools/list":
-                      result = { tools };
+                      result = { tools: tools.filter(t => isToolEnabled(t.name)) };
                       break;
                     case "tools/call":
                       if (!params?.name) {
                         throw new Error("Missing tool name");
+                      }
+                      if (!isToolEnabled(params.name)) {
+                        throw new Error(`Tool is disabled: ${params.name}`);
                       }
                       {
                         const toolArgs = coerceToolArgs(params.name, params.arguments || {});
@@ -3922,6 +3972,71 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             mode: allowed.length === 0 ? "all" : "restricted",
             allowedAccountIds: allowed,
             accounts,
+          };
+        },
+
+        getToolAccessConfig: async function() {
+          // Use same fail-closed parsing as getDisabledTools() so the UI
+          // accurately reflects the server's actual state on corrupt prefs
+          let disabled = [];
+          let corrupt = false;
+          try {
+            const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
+            if (pref) {
+              const parsed = JSON.parse(pref);
+              if (!Array.isArray(parsed)) {
+                corrupt = true;
+              } else {
+                disabled = parsed;
+              }
+            }
+          } catch {
+            corrupt = true;
+          }
+
+          const toolList = ALL_TOOL_NAMES.map(name => ({
+            name,
+            enabled: corrupt ? UNDISABLEABLE_TOOLS.has(name) : !disabled.includes(name),
+            undisableable: UNDISABLEABLE_TOOLS.has(name),
+          }));
+          const result = {
+            mode: corrupt ? "error" : (disabled.length === 0 ? "all" : "restricted"),
+            disabledTools: disabled,
+            tools: toolList,
+          };
+          if (corrupt) {
+            result.error = "Disabled tools preference is corrupt. All non-infrastructure tools are blocked. Save to reset.";
+          }
+          return result;
+        },
+
+        setToolAccess: async function(disabledTools) {
+          if (!Array.isArray(disabledTools)) {
+            return { error: "disabledTools must be an array" };
+          }
+          // Validate types first, then semantic checks
+          if (!disabledTools.every(t => typeof t === "string")) {
+            return { error: "All tool names must be strings" };
+          }
+          // Reject internal sentinel values
+          if (disabledTools.includes("__all__")) {
+            return { error: "Invalid tool name: __all__" };
+          }
+          // Validate: can't disable undisableable tools
+          const blocked = disabledTools.filter(t => UNDISABLEABLE_TOOLS.has(t));
+          if (blocked.length > 0) {
+            return { error: `Cannot disable infrastructure tools: ${blocked.join(", ")}` };
+          }
+
+          if (disabledTools.length === 0) {
+            try { Services.prefs.clearUserPref(PREF_DISABLED_TOOLS); } catch { /* ignore */ }
+          } else {
+            Services.prefs.setStringPref(PREF_DISABLED_TOOLS, JSON.stringify(disabledTools));
+          }
+          return {
+            success: true,
+            mode: disabledTools.length === 0 ? "all" : "restricted",
+            disabledTools,
           };
         },
 
