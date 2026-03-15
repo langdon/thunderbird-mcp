@@ -1,6 +1,6 @@
 # Thunderbird MCP
 
-[![Tools](https://img.shields.io/badge/24_Tools-email%2C_compose%2C_filters%2C_calendar-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/32_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -17,7 +17,7 @@ Give your AI assistant full access to Thunderbird — search mail, compose messa
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 24 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 32 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Compose tools open a review window before sending. **Nothing gets sent without your approval.**
 
@@ -26,12 +26,12 @@ Compose tools open a review window before sending. **Nothing gets sent without y
 ## How it works
 
 ```
-                    stdio              HTTP (localhost:8765)
+                    stdio              HTTP (localhost:8765-8774)
   MCP Client  <----------->  Bridge  <--------------------->  Thunderbird
   (Claude, etc.)           mcp-bridge.cjs                    Extension + HTTP Server
 ```
 
-The Thunderbird extension embeds a local HTTP server. The Node.js bridge translates between MCP's stdio protocol and HTTP. Your AI talks stdio, Thunderbird talks HTTP, the bridge connects them. The bridge handles MCP lifecycle methods (initialize, ping) locally, so clients can connect even before Thunderbird is fully loaded.
+The Thunderbird extension embeds a local HTTP server with session-scoped auth tokens. The Node.js bridge translates between MCP's stdio protocol and HTTP, discovering the port and token automatically via a connection file. The bridge handles MCP lifecycle methods (initialize, ping) locally, so clients can connect even before Thunderbird is fully loaded.
 
 ---
 
@@ -43,12 +43,15 @@ The Thunderbird extension embeds a local HTTP server. The Node.js bridge transla
 |------|-------------|
 | `listAccounts` | List all email accounts and their identities |
 | `listFolders` | Browse folder tree with message counts — filter by account or subtree |
-| `searchMessages` | Find emails by subject, sender, recipient, date range, read status, or within a specific folder |
+| `searchMessages` | Find emails by subject, sender, recipient, date range, tags, or within a specific folder. Supports `includeSubfolders` and offset-based pagination. |
 | `getMessage` | Read full email content with optional attachment saving -- includes inline CID images |
-| `getRecentMessages` | Get recent messages with date and unread filtering |
-| `updateMessage` | Mark read/unread, flag/unflag, move between folders, or trash -- supports bulk via `messageIds` |
-| `deleteMessages` | Delete messages — drafts are safely moved to Trash |
+| `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. |
+| `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move between folders, or trash -- supports bulk via `messageIds` |
+| `deleteMessages` | Delete messages -- drafts are safely moved to Trash |
 | `createFolder` | Create new subfolders to organize your mail |
+| `renameFolder` | Rename an existing mail folder |
+| `deleteFolder` | Delete a folder (moves to Trash, or permanently deletes if already in Trash) |
+| `moveFolder` | Move a folder to a new parent within the same account |
 
 ### Compose
 
@@ -58,7 +61,7 @@ The Thunderbird extension embeds a local HTTP server. The Node.js bridge transla
 | `replyToMessage` | Reply with quoted original and proper threading |
 | `forwardMessage` | Forward with all original attachments preserved |
 
-All compose tools open a window for you to review and edit before sending.
+All compose tools open a window for you to review and edit before sending. Attachments can be file paths or inline base64 objects.
 
 ### Filters
 
@@ -73,17 +76,33 @@ All compose tools open a window for you to review and edit before sending.
 
 Full control over Thunderbird's message filters. Changes persist immediately. Your AI can create sorting rules, adjust priorities, and run them on existing mail.
 
-### Contacts & Calendar
+### Contacts
 
 | Tool | Description |
 |------|-------------|
-| `searchContacts` | Look up contacts from your address books |
+| `searchContacts` | Search contacts across all address books by email or name. Supports `maxResults`. |
+| `createContact` | Create a new contact in any writable address book |
+| `updateContact` | Update an existing contact's email, name, or display name |
+| `deleteContact` | Delete a contact by UID |
+
+### Calendar
+
+| Tool | Description |
+|------|-------------|
 | `listCalendars` | List all calendars with read-only, event, and task support flags |
 | `createEvent` | Create a calendar event -- opens a review dialog, or set `skipReview` to add directly |
 | `listEvents` | Query events by date range with recurring event expansion |
 | `updateEvent` | Modify an event's title, dates, location, or description |
 | `deleteEvent` | Delete a calendar event by ID |
 | `createTask` | Open a pre-filled task dialog for review |
+
+### Access Control
+
+| Tool | Description |
+|------|-------------|
+| `getAccountAccess` | View which accounts the MCP server can access |
+
+Account and tool access are configured via the extension settings page (Tools > Add-ons > Thunderbird MCP > Options). Access control is not MCP-exposed -- only the user can change it.
 
 ---
 
@@ -118,7 +137,11 @@ That's it. Your AI can now access Thunderbird.
 
 ## Security
 
-The extension listens on `localhost:8765` only. No remote access. However, any local process can reach it while Thunderbird is running — keep this in mind on shared machines.
+- **Auth tokens**: The HTTP server requires a session-scoped bearer token. Generated on startup, written to `<TmpD>/thunderbird-mcp/connection.json` with 0600 permissions. The bridge reads this automatically.
+- **Dynamic port**: Tries ports 8765-8774, records the actual port in the connection file. No hardcoded port dependency.
+- **Account access control**: Restrict which email accounts are visible to MCP clients via the settings page. Changes take effect immediately.
+- **Tool access control**: Disable specific tools via the settings page. Disabled tools are hidden from `tools/list` and blocked at dispatch.
+- **Localhost only**: No remote access. The bridge fails closed -- refuses to forward requests without a valid token.
 
 ---
 
@@ -139,13 +162,16 @@ The extension listens on `localhost:8765` only. No remote access. However, any l
 # Build the extension
 ./scripts/build.sh
 
-# Test the HTTP API directly
-curl -X POST http://localhost:8765 \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-
-# Test the bridge
+# Test via the bridge (handles auth automatically)
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | node mcp-bridge.cjs
+
+# Test the HTTP API directly (requires auth token from connection file)
+TOKEN=$(cat /tmp/thunderbird-mcp/connection.json | jq -r .token)
+PORT=$(cat /tmp/thunderbird-mcp/connection.json | jq -r .port)
+curl -X POST http://127.0.0.1:$PORT \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
 After changing extension code: remove from Thunderbird, restart, reinstall the XPI, restart again. Thunderbird caches aggressively.
@@ -156,14 +182,18 @@ After changing extension code: remove from Thunderbird, restart, reinstall the X
 
 ```
 thunderbird-mcp/
-├── mcp-bridge.cjs              # stdio <-> HTTP bridge
+├── mcp-bridge.cjs              # stdio <-> HTTP bridge (auth, port discovery)
 ├── extension/
 │   ├── manifest.json
 │   ├── background.js           # Extension entry point
 │   ├── httpd.sys.mjs           # Embedded HTTP server (Mozilla)
+│   ├── options.html            # Settings page UI
+│   ├── options.js              # Settings page logic
+│   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 24 MCP tools
+│       ├── api.js              # All 32 MCP tools + auth + access control
 │       └── schema.json
+├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/
     ├── build.sh
     └── install.sh
@@ -175,6 +205,9 @@ thunderbird-mcp/
 - Email bodies with control characters are sanitized to avoid breaking JSON
 - HTML-only emails are converted to plain text (original formatting is lost)
 - Recurring calendar event CRUD operates on the series, not individual occurrences
+- IMAP folder operations (rename, delete, move) are async -- verify with `listFolders` after
+- Combining tags with move/trash on IMAP may not preserve tags on the moved copy -- use separate calls
+- Pre-existing Thunderbird filters with cross-account move/copy targets are not restricted by account access control
 
 ---
 
