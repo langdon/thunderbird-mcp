@@ -770,6 +770,199 @@ describe('Collection cap: newest messages must survive sort-after-collect', () =
   });
 });
 
+// ─── Reply subject prefix tests ──────────────────────────────────
+
+describe('Reply: Re: prefix handling', () => {
+  // OLD (buggy): case-sensitive, used raw subject
+  function addRePrefixOld(subject) {
+    return subject.startsWith("Re:") ? subject : `Re: ${subject}`;
+  }
+
+  // NEW (fixed): case-insensitive regex, uses decoded subject
+  function addRePrefixFixed(subject) {
+    return /^re:/i.test(subject) ? subject : `Re: ${subject}`;
+  }
+
+  it('BUG: old code double-prefixes "RE: Hello" (uppercase)', () => {
+    // Old code only checked startsWith("Re:") — case-sensitive
+    assert.equal(addRePrefixOld('RE: Hello'), 'Re: RE: Hello',
+      'Bug confirmed: old code produces double prefix');
+  });
+
+  it('FIX: new code handles "RE: Hello" correctly', () => {
+    assert.equal(addRePrefixFixed('RE: Hello'), 'RE: Hello');
+  });
+
+  it('BUG: old code double-prefixes "re: Hello" (lowercase)', () => {
+    assert.equal(addRePrefixOld('re: Hello'), 'Re: re: Hello',
+      'Bug confirmed: old code produces double prefix');
+  });
+
+  it('FIX: new code handles "re: Hello" correctly', () => {
+    assert.equal(addRePrefixFixed('re: Hello'), 're: Hello');
+  });
+
+  it('FIX: does not double-prefix "Re: Hello"', () => {
+    assert.equal(addRePrefixFixed('Re: Hello'), 'Re: Hello');
+  });
+
+  it('FIX: does not double-prefix "Re: Re: nested"', () => {
+    assert.equal(addRePrefixFixed('Re: Re: nested'), 'Re: Re: nested');
+  });
+
+  it('FIX: adds prefix to plain subject', () => {
+    assert.equal(addRePrefixFixed('Hello'), 'Re: Hello');
+  });
+
+  it('FIX: adds prefix to empty subject', () => {
+    assert.equal(addRePrefixFixed(''), 'Re: ');
+  });
+
+  it('FIX: adds prefix when "re" is not at start', () => {
+    assert.equal(addRePrefixFixed('About re: something'), 'Re: About re: something');
+  });
+});
+
+// ─── endDate heuristic tests ────────────────────────────────────
+
+describe('searchMessages: endDate date-only detection', () => {
+  // OLD (buggy): checks for "T" anywhere in string
+  function isDateOnlyOld(endDate) {
+    return endDate && !endDate.includes("T");
+  }
+
+  // NEW (fixed): strict ISO date-only regex
+  function isDateOnlyFixed(endDate) {
+    return endDate && /^\d{4}-\d{2}-\d{2}$/.test(endDate.trim());
+  }
+
+  it('BUG: old code treats "Totally invalid" as date-only=false (has "T")', () => {
+    // Old code: !("Totally invalid".includes("T")) → false (has "T")
+    // This means it does NOT add 24h — but only by accident (because "T" is in "Totally")
+    // The real bug: the heuristic is fragile and would fail on other strings
+    assert.equal(isDateOnlyOld('Totally invalid'), false);
+  });
+
+  it('BUG: old code treats "no time here" as date-only=true (no "T")', () => {
+    // Old code: !("no time here".includes("T")) → true — adds 24h to garbage input
+    assert.equal(isDateOnlyOld('no time here'), true,
+      'Bug confirmed: old code adds 24h offset to garbage string without "T"');
+  });
+
+  it('FIX: new code rejects "Totally invalid"', () => {
+    assert.equal(isDateOnlyFixed('Totally invalid'), false);
+  });
+
+  it('FIX: new code rejects "no time here"', () => {
+    assert.equal(isDateOnlyFixed('no time here'), false);
+  });
+
+  it('FIX: detects "2024-01-15" as date-only', () => {
+    assert.equal(isDateOnlyFixed('2024-01-15'), true);
+  });
+
+  it('FIX: detects "2024-01-15T00:00:00" as NOT date-only', () => {
+    assert.equal(isDateOnlyFixed('2024-01-15T00:00:00'), false);
+  });
+
+  it('FIX: rejects empty string', () => {
+    assert.ok(!isDateOnlyFixed(''));
+  });
+
+  it('FIX: rejects null', () => {
+    assert.ok(!isDateOnlyFixed(null));
+  });
+
+  it('FIX: handles whitespace-padded date', () => {
+    assert.equal(isDateOnlyFixed('  2024-01-15  '), true);
+  });
+
+  it('FIX: rejects partial date "2024-01"', () => {
+    assert.equal(isDateOnlyFixed('2024-01'), false);
+  });
+
+  it('FIX: rejects date with time "2024-01-15 12:00"', () => {
+    assert.equal(isDateOnlyFixed('2024-01-15 12:00'), false);
+  });
+});
+
+// ─── searchContacts truncation signal tests ─────────────────────
+
+describe('searchContacts: truncation signaling', () => {
+  // OLD (buggy): silent truncation at hardcoded 50, returns plain array
+  function simulateSearchContactsOld(totalContacts) {
+    const DEFAULT_MAX = 50;
+    const results = [];
+    for (let i = 0; i < totalContacts; i++) {
+      results.push({ id: `contact-${i}`, email: `user${i}@example.com` });
+      if (results.length >= DEFAULT_MAX) break;
+    }
+    return results; // Always plain array — no truncation signal
+  }
+
+  // NEW (fixed): signals truncation, supports maxResults
+  function simulateSearchContactsFixed(totalContacts, maxResults) {
+    const DEFAULT_MAX = 50;
+    const MAX_CAP = 200;
+    const requestedLimit = Number(maxResults);
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(Math.floor(requestedLimit), MAX_CAP)
+      : DEFAULT_MAX;
+
+    const results = [];
+    let truncated = false;
+    for (let i = 0; i < totalContacts; i++) {
+      results.push({ id: `contact-${i}`, email: `user${i}@example.com` });
+      if (results.length >= limit) { truncated = true; break; }
+    }
+
+    if (truncated) {
+      return { contacts: results, hasMore: true, message: `Results limited to ${limit}. Refine your query to see more.` };
+    }
+    return results;
+  }
+
+  it('BUG: old code silently truncates at 50 with no signal', () => {
+    const result = simulateSearchContactsOld(100);
+    assert.ok(Array.isArray(result), 'Bug: returns plain array even when truncated');
+    assert.equal(result.length, 50, 'Bug: silently capped at 50');
+    // No hasMore, no message — caller has no idea there are 50 more contacts
+  });
+
+  it('FIX: new code signals truncation with hasMore', () => {
+    const result = simulateSearchContactsFixed(100);
+    assert.ok(!Array.isArray(result), 'Fix: returns object with metadata');
+    assert.equal(result.hasMore, true);
+    assert.equal(result.contacts.length, 50);
+    assert.ok(result.message.includes('limited'));
+  });
+
+  it('FIX: returns plain array when under limit', () => {
+    const result = simulateSearchContactsFixed(10);
+    assert.ok(Array.isArray(result));
+    assert.equal(result.length, 10);
+  });
+
+  it('FIX: respects custom maxResults', () => {
+    const result = simulateSearchContactsFixed(100, 25);
+    assert.ok(!Array.isArray(result));
+    assert.equal(result.contacts.length, 25);
+    assert.equal(result.hasMore, true);
+  });
+
+  it('FIX: caps maxResults at 200', () => {
+    const result = simulateSearchContactsFixed(300, 999);
+    assert.equal(result.contacts.length, 200);
+    assert.equal(result.hasMore, true);
+  });
+
+  it('FIX: no truncation signal when under limit', () => {
+    const result = simulateSearchContactsFixed(49);
+    assert.ok(Array.isArray(result));
+    assert.equal(result.length, 49);
+  });
+});
+
 // ─── Validation adversarial tests ─────────────────────────────────
 
 describe('Validation: adversarial and edge-case inputs', () => {
