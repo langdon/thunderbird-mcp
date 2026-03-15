@@ -361,9 +361,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            messageId: { type: "string", description: "A single message ID (from searchMessages results). Use messageId or messageIds, not both." },
-            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs for bulk operations. Use messageId or messageIds, not both." },
-            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+            messageId: { type: "string", description: "A single message ID (from searchMessages results). Required unless messageIds is provided." },
+            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs for bulk operations. Required unless messageId is provided." },
+            folderPath: { type: "string", description: "The folder URI containing the message(s) (from searchMessages results)" },
             read: { type: "boolean", description: "Set to true/false to mark read/unread (optional)" },
             flagged: { type: "boolean", description: "Set to true/false to flag/unflag (optional)" },
             addTags: { type: "array", items: { type: "string" }, description: "Tag keywords to add (e.g. ['$label1', 'project-x']). Thunderbird built-in tags: $label1 (Important), $label2 (Work), $label3 (Personal), $label4 (To Do), $label5 (Later)" },
@@ -1505,7 +1505,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       email: card.primaryEmail,
                       firstName: card.firstName,
                       lastName: card.lastName,
-                      addressBook: book.dirName
+                      addressBook: book.dirName,
+                      addressBookId: book.URI,
                     });
                   }
 
@@ -2033,8 +2034,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (dueDate) {
                   const js = new Date(dueDate);
                   if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
-                  // Date-only string (no "T") means all-day
-                  if (!dueDate.includes("T")) {
+                  // Date-only string (YYYY-MM-DD) means all-day
+                  if (/^\d{4}-\d{2}-\d{2}$/.test(dueDate.trim())) {
                     dueDt = cal.createDateTime();
                     dueDt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
                     dueDt.isDate = true;
@@ -2566,8 +2567,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       composeFields.cc = cc || "";
                       composeFields.bcc = bcc || "";
 
-                      const origSubject = msgHdr.subject || "";
-                      composeFields.subject = origSubject.startsWith("Fwd:") ? origSubject : `Fwd: ${origSubject}`;
+                      const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                      composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
 
                       // Get original body
                       const originalBody = extractPlainTextBody(aMimeMsg);
