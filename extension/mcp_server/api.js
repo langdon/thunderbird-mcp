@@ -35,7 +35,8 @@ const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
 const ALL_TOOL_NAMES = [
   "listAccounts", "listFolders", "searchMessages", "getMessage",
   "sendMail", "replyToMessage", "forwardMessage", "deleteMessages",
-  "updateMessage", "getRecentMessages", "createFolder", "renameFolder",
+  "updateMessage", "getRecentMessages", "displayMessage",
+  "createFolder", "renameFolder",
   "deleteFolder", "emptyTrash", "emptyJunk", "moveFolder",
   "searchContacts", "createContact", "updateContact", "deleteContact",
   "listCalendars", "createEvent", "listEvents", "updateEvent",
@@ -341,6 +342,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             includeSubfolders: { type: "boolean", description: "If false, only return messages from the specified folder — not its subfolders. Default: true." },
           },
           required: [],
+        },
+      },
+      {
+        name: "displayMessage",
+        title: "Display Message",
+        description: "Open or navigate to a message in the Thunderbird GUI. Use '3pane' (default) to select the message in the mail view, 'tab' to open in a new tab, or 'window' to open in a standalone window.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The message ID (from searchMessages results)" },
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+            displayMode: { type: "string", enum: ["3pane", "tab", "window"], description: "How to display: '3pane' (navigate in mail view, default), 'tab' (new tab), or 'window' (new window)" },
+          },
+          required: ["messageId", "folderPath"],
         },
       },
       {
@@ -2690,6 +2705,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
+            function displayMessage(messageId, folderPath, displayMode) {
+              const found = findMessage(messageId, folderPath);
+              if (found.error) return found;
+              const { msgHdr } = found;
+
+              const win = Services.wm.getMostRecentWindow("mail:3pane");
+              if (!win) return { error: "No Thunderbird mail window found" };
+
+              const { MailUtils } = ChromeUtils.importESModule(
+                "resource:///modules/MailUtils.sys.mjs"
+              );
+
+              const mode = displayMode || "3pane";
+              switch (mode) {
+                case "tab": {
+                  const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
+                  const tabmail = win.document.getElementById("tabmail");
+                  if (!tabmail) return { error: "Could not access tabmail interface" };
+                  tabmail.openTab("mailMessageTab", { messageURI: msgUri, msgHdr });
+                  break;
+                }
+                case "window":
+                  MailUtils.openMessageInNewWindow(msgHdr);
+                  break;
+                case "3pane":
+                default:
+                  MailUtils.displayMessageInFolderTab(msgHdr);
+                  break;
+              }
+
+              return { success: true, displayMode: mode, subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "" };
+            }
+
             function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
               const results = [];
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
@@ -3843,6 +3891,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
                 case "getRecentMessages":
                   return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
+                case "displayMessage":
+                  return displayMessage(args.messageId, args.folderPath, args.displayMode);
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
@@ -4069,7 +4119,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         getServerInfo: async function() {
           let port = null;
           let connectionFile = null;
-          let buildCommit = null;
+          let buildVersion = null;
           let buildDate = null;
 
           // Read build info from bundled file via resource: protocol
@@ -4085,7 +4135,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const text = sis.read(sis.available());
             sis.close();
             const bi = JSON.parse(text);
-            buildCommit = bi.commit || null;
+            buildVersion = bi.version || bi.commit || null;
             buildDate = bi.builtAt || null;
           } catch { /* build info not available */ }
 
@@ -4114,7 +4164,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             running: !!globalThis.__tbMcpStartPromise,
             port,
             connectionFile,
-            buildCommit,
+            buildVersion,
             buildDate,
           };
         },
