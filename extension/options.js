@@ -17,6 +17,15 @@ const saveToolsStatus = document.getElementById("saveToolsStatus");
 let currentAccounts = [];
 let currentTools = [];
 
+const TOOL_GROUPS = [
+  { label: "Messages", tools: ["searchMessages", "getMessage", "getRecentMessages", "sendMail", "replyToMessage", "forwardMessage", "updateMessage", "deleteMessages"] },
+  { label: "Folders", tools: ["createFolder", "renameFolder", "moveFolder", "deleteFolder"] },
+  { label: "Contacts", tools: ["searchContacts", "createContact", "updateContact", "deleteContact"] },
+  { label: "Calendar", tools: ["listCalendars", "listEvents", "createEvent", "updateEvent", "deleteEvent", "createTask"] },
+  { label: "Filters", tools: ["listFilters", "createFilter", "updateFilter", "deleteFilter", "reorderFilters", "applyFilters"] },
+  { label: "System", tools: ["listAccounts", "listFolders", "getAccountAccess"] },
+];
+
 async function loadServerInfo() {
   try {
     const info = await browser.mcpServer.getServerInfo();
@@ -134,34 +143,52 @@ async function loadToolAccess() {
       return;
     }
 
-    toolList.innerHTML = "";
+    // Index tools by name for quick lookup
+    const toolMap = {};
     for (const tool of currentTools) {
-      const li = document.createElement("li");
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.id = "tool-" + tool.name;
-      checkbox.value = tool.name;
-      checkbox.checked = tool.enabled;
-      if (tool.undisableable) {
-        checkbox.disabled = true;
-      }
-      checkbox.addEventListener("change", () => {
-        saveToolsStatus.textContent = "";
-      });
+      toolMap[tool.name] = tool;
+    }
 
-      const label = document.createElement("label");
-      label.htmlFor = checkbox.id;
-      label.textContent = tool.name;
-      if (tool.undisableable) {
-        const lockSpan = document.createElement("span");
-        lockSpan.className = "account-type";
-        lockSpan.textContent = "required";
-        label.appendChild(lockSpan);
-      }
+    toolList.innerHTML = "";
+    for (const group of TOOL_GROUPS) {
+      // Group header
+      const header = document.createElement("li");
+      header.className = "tool-group-header";
+      header.textContent = group.label;
+      toolList.appendChild(header);
 
-      li.appendChild(checkbox);
-      li.appendChild(label);
-      toolList.appendChild(li);
+      // Tools in this group
+      for (const toolName of group.tools) {
+        const tool = toolMap[toolName];
+        if (!tool) continue;
+
+        const li = document.createElement("li");
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.id = "tool-" + tool.name;
+        checkbox.value = tool.name;
+        checkbox.checked = tool.enabled;
+        if (tool.undisableable) {
+          checkbox.disabled = true;
+        }
+        checkbox.addEventListener("change", () => {
+          saveToolsStatus.textContent = "";
+        });
+
+        const label = document.createElement("label");
+        label.htmlFor = checkbox.id;
+        label.textContent = tool.name;
+        if (tool.undisableable) {
+          const lockSpan = document.createElement("span");
+          lockSpan.className = "account-type";
+          lockSpan.textContent = "required";
+          label.appendChild(lockSpan);
+        }
+
+        li.appendChild(checkbox);
+        li.appendChild(label);
+        toolList.appendChild(li);
+      }
     }
 
     saveToolsBtn.disabled = false;
