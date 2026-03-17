@@ -1,6 +1,6 @@
 # Thunderbird MCP
 
-[![Tools](https://img.shields.io/badge/32_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/35_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -17,7 +17,7 @@ Give your AI assistant full access to Thunderbird — search mail, compose messa
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 32 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 35 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Compose tools open a review window before sending. **Nothing gets sent without your approval.**
 
@@ -43,15 +43,18 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 |------|-------------|
 | `listAccounts` | List all email accounts and their identities |
 | `listFolders` | Browse folder tree with message counts — filter by account or subtree |
-| `searchMessages` | Find emails by subject, sender, recipient, date range, tags, or within a specific folder. Supports `includeSubfolders` and offset-based pagination. |
+| `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. |
 | `getMessage` | Read full email content with optional attachment saving -- includes inline CID images |
-| `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. |
+| `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
+| `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
 | `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move between folders, or trash -- supports bulk via `messageIds` |
 | `deleteMessages` | Delete messages -- drafts are safely moved to Trash |
 | `createFolder` | Create new subfolders to organize your mail |
 | `renameFolder` | Rename an existing mail folder |
 | `deleteFolder` | Delete a folder (moves to Trash, or permanently deletes if already in Trash) |
 | `moveFolder` | Move a folder to a new parent within the same account |
+| `emptyTrash` | Permanently delete all messages in Trash (including subfolders) |
+| `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
 
 ### Compose
 
@@ -191,7 +194,7 @@ thunderbird-mcp/
 │   ├── options.js              # Settings page logic
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 32 MCP tools + auth + access control
+│       ├── api.js              # All 35 MCP tools + auth + access control
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/
