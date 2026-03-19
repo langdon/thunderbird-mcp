@@ -1088,7 +1088,7 @@ describe('Validation: adversarial and edge-case inputs', () => {
       type: "object",
       properties: {
         to: { type: "string" }, subject: { type: "string" }, body: { type: "string" },
-        attachments: { type: "array", items: { type: "string" } },
+        attachments: { type: "array", items: { oneOf: [{ type: "string" }, { type: "object" }] } },
       },
       required: ["to", "subject", "body"],
     }},
