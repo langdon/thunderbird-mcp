@@ -115,7 +115,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           properties: {
             messageId: { type: "string", description: "The message ID (from searchMessages results)" },
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
-            saveAttachments: { type: "boolean", description: "If true, save attachments to <OS temp dir>/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" }
+            saveAttachments: { type: "boolean", description: "If true, save attachments to <OS temp dir>/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" },
+            bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format: 'markdown' (default, preserves structure), 'text' (plain text), 'html' (raw HTML)" },
           },
           required: ["messageId", "folderPath"],
         },
@@ -1479,20 +1480,113 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Extracts plain text body from a MIME message.
-             * Tries coerceBodyToPlaintext first, then walks MIME tree for HTML fallback.
+             * Converts HTML to markdown using DOMParser for structure-preserving
+             * body extraction. Handles headings, links, bold/italic, lists,
+             * blockquotes, code blocks, images, and horizontal rules. Email
+             * tables (usually layout, not data) are flattened to text.
+             * Falls back to stripHtml if DOMParser is unavailable.
              */
-            function extractPlainTextBody(aMimeMsg) {
-              if (!aMimeMsg) return "";
+            function htmlToMarkdown(html) {
+              if (!html) return "";
+              try {
+                const doc = new DOMParser().parseFromString(html, "text/html");
+
+                function walkChildren(node) {
+                  return Array.from(node.childNodes).map(walk).join("");
+                }
+
+                function walk(node) {
+                  if (node.nodeType === 3) { // Text
+                    return node.textContent.replace(/[ \t]+/g, " ");
+                  }
+                  if (node.nodeType !== 1) return "";
+                  const tag = node.tagName.toLowerCase();
+                  const inner = () => walkChildren(node);
+
+                  switch (tag) {
+                    case "script": case "style": case "head": return "";
+                    case "br": return "\n";
+                    case "hr": return "\n\n---\n\n";
+                    case "p": case "div": case "section": case "article":
+                      return "\n\n" + inner().trim() + "\n\n";
+                    case "h1": return "\n\n# " + inner().trim() + "\n\n";
+                    case "h2": return "\n\n## " + inner().trim() + "\n\n";
+                    case "h3": return "\n\n### " + inner().trim() + "\n\n";
+                    case "h4": return "\n\n#### " + inner().trim() + "\n\n";
+                    case "h5": return "\n\n##### " + inner().trim() + "\n\n";
+                    case "h6": return "\n\n###### " + inner().trim() + "\n\n";
+                    case "strong": case "b": {
+                      const t = inner().trim();
+                      return t ? "**" + t + "**" : "";
+                    }
+                    case "em": case "i": {
+                      const t = inner().trim();
+                      return t ? "*" + t + "*" : "";
+                    }
+                    case "a": {
+                      const href = node.getAttribute("href") || "";
+                      const text = inner().trim();
+                      // Skip empty/anchor-only links and mailto: without text
+                      if (!text && !href) return "";
+                      if (href && text && text !== href) return `[${text}](${href})`;
+                      return text || href;
+                    }
+                    case "img": {
+                      const alt = node.getAttribute("alt") || "";
+                      const src = node.getAttribute("src") || "";
+                      // Skip tracking pixels (1x1, tiny, or data: without alt)
+                      const w = parseInt(node.getAttribute("width")) || 0;
+                      const h = parseInt(node.getAttribute("height")) || 0;
+                      if ((w > 0 && w <= 3) || (h > 0 && h <= 3)) return "";
+                      if (src.startsWith("data:") && !alt) return "";
+                      if (src) return `![${alt}](${src})`;
+                      return alt;
+                    }
+                    case "code": return "`" + node.textContent + "`";
+                    case "pre": return "\n\n```\n" + node.textContent.trim() + "\n```\n\n";
+                    case "blockquote": {
+                      const text = inner().trim();
+                      return "\n\n" + text.split("\n").map(l => "> " + l).join("\n") + "\n\n";
+                    }
+                    case "ul": case "ol": return "\n" + inner() + "\n";
+                    case "li": {
+                      const parent = node.parentElement;
+                      const isOl = parent && parent.tagName.toLowerCase() === "ol";
+                      return (isOl ? "1. " : "- ") + inner().trim() + "\n";
+                    }
+                    // Tables: extract text with spacing (email tables are usually layout)
+                    case "table": return "\n\n" + inner().trim() + "\n\n";
+                    case "tr": return inner().trim() + "\n";
+                    case "td": case "th": return inner().trim() + " ";
+                    case "thead": case "tbody": case "tfoot": return inner();
+                    default: return inner();
+                  }
+                }
+
+                const body = doc.body || doc.documentElement;
+                let result = walk(body);
+                // Collapse excessive newlines, trim
+                result = result.replace(/\n{3,}/g, "\n\n").trim();
+                return result;
+              } catch {
+                // DOMParser unavailable or parse failure -- fall back to stripHtml
+                return stripHtml(html);
+              }
+            }
+
+            /**
+             * Extracts raw body content from a MIME message.
+             * Returns { text, isHtml } without any format conversion.
+             */
+            function extractBodyContent(aMimeMsg) {
+              if (!aMimeMsg) return { text: "", isHtml: false };
               try {
                 const text = aMimeMsg.coerceBodyToPlaintext();
-                if (text) return text;
+                if (text) return { text, isHtml: false };
               } catch { /* fall through */ }
               try {
                 function findBody(part, isRoot = false) {
                   const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
-                  // Skip nested messages (attached emails) -- their body is not ours.
-                  // Allow the root message/rfc822 so we recurse into its children.
                   if (ct === "message/rfc822" && !isRoot) return null;
                   if (ct !== "message/rfc822") {
                     if (ct === "text/plain" && part.body) return { text: part.body, isHtml: false };
@@ -1510,9 +1604,36 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return null;
                 }
                 const found = findBody(aMimeMsg, true);
-                if (found) return found.isHtml ? stripHtml(found.text) : found.text;
+                if (found) return found;
               } catch { /* give up */ }
-              return "";
+              return { text: "", isHtml: false };
+            }
+
+            /**
+             * Extracts plain text body from a MIME message.
+             * Tries coerceBodyToPlaintext first, then walks MIME tree for HTML fallback.
+             */
+            function extractPlainTextBody(aMimeMsg) {
+              const { text, isHtml } = extractBodyContent(aMimeMsg);
+              return isHtml ? stripHtml(text) : text;
+            }
+
+            /**
+             * Extracts body from a MIME message in the requested format.
+             * Returns { body, bodyIsHtml } for use in getMessage.
+             */
+            function extractFormattedBody(aMimeMsg, bodyFormat) {
+              const { text, isHtml } = extractBodyContent(aMimeMsg);
+              if (!isHtml) return { body: text, bodyIsHtml: false };
+              switch (bodyFormat) {
+                case "html":
+                  return { body: text, bodyIsHtml: true };
+                case "text":
+                  return { body: stripHtml(text), bodyIsHtml: false };
+                case "markdown":
+                default:
+                  return { body: htmlToMarkdown(text), bodyIsHtml: false };
+              }
             }
 
             /**
@@ -2394,7 +2515,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-	            function getMessage(messageId, folderPath, saveAttachments) {
+	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat) {
 	              return new Promise((resolve) => {
 	                try {
 	                  const found = findMessage(messageId, folderPath);
@@ -2414,8 +2535,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return;
                     }
 
-                    let body = extractPlainTextBody(aMimeMsg);
-                    let bodyIsHtml = false;
+                    const fmt = extractFormattedBody(aMimeMsg, bodyFormat || "markdown");
+                    let body = fmt.body;
+                    let bodyIsHtml = fmt.bodyIsHtml;
                     if (!body) body = "(Could not extract body text)";
 
                     // Always collect attachment metadata
@@ -4180,7 +4302,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "searchMessages":
                   return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly);
                 case "getMessage":
-                  return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
+                  return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat);
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
                 case "createContact":
