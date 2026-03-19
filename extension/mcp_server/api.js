@@ -124,7 +124,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "sendMail",
         group: "messages", crud: "create",
         title: "Compose Mail",
-        description: "Compose a new email. Opens a compose window with pre-filled recipient, subject, and body for user review before sending.",
+        description: "Compose a new email. By default opens a compose window for review; set skipReview to send directly.",
         inputSchema: {
           type: "object",
           properties: {
@@ -135,6 +135,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            skipReview: { type: "boolean", description: "If true, send the message directly without opening a compose window (default: false)" },
             attachments: {
               type: "array",
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
@@ -314,7 +315,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "replyToMessage",
         group: "messages", crud: "create",
         title: "Reply to Message",
-        description: "Reply to a message. Opens a compose window with quoted original text and proper threading headers for user review before sending.",
+        description: "Reply to a message. By default opens a compose window with quoted original text for review; set skipReview to send directly.",
         inputSchema: {
           type: "object",
           properties: {
@@ -327,6 +328,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            skipReview: { type: "boolean", description: "If true, send the reply directly without opening a compose window (default: false)" },
             attachments: {
               type: "array",
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
@@ -354,7 +356,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "forwardMessage",
         group: "messages", crud: "create",
         title: "Forward Message",
-        description: "Forward a message. Opens a compose window with the original message content and attachments for user review before sending.",
+        description: "Forward a message. By default opens a compose window with original content for review; set skipReview to send directly.",
         inputSchema: {
           type: "object",
           properties: {
@@ -366,6 +368,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            skipReview: { type: "boolean", description: "If true, send the forward directly without opening a compose window (default: false)" },
             attachments: {
               type: "array",
               description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})",
@@ -1284,6 +1287,96 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   } catch {}
                 }
               }, COMPOSE_WINDOW_LOAD_DELAY_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+            }
+
+            /**
+             * Sends a message directly via nsIMsgSend without opening a compose window.
+             * Used by composeMail, replyToMessage, forwardMessage when skipReview=true.
+             */
+            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType) {
+              return new Promise((resolve) => {
+                try {
+                  const msgSend = Cc["@mozilla.org/messengercompose/send;1"]
+                    .createInstance(Ci.nsIMsgSend);
+
+                  // Build nsIMutableArray of nsIMsgAttachment
+                  const attachArray = Cc["@mozilla.org/array;1"]
+                    .createInstance(Ci.nsIMutableArray);
+
+                  for (const desc of attachDescs) {
+                    try {
+                      const att = Cc["@mozilla.org/messengercompose/attachment;1"]
+                        .createInstance(Ci.nsIMsgAttachment);
+                      att.url = desc.url;
+                      att.name = desc.name;
+                      if (desc.size != null) att.size = desc.size;
+                      if (desc.contentType) att.contentType = desc.contentType;
+                      attachArray.appendElement(att);
+                    } catch {}
+                  }
+
+                  // Extract body -- createAndSendMessage takes it as a separate param
+                  const body = composeFields.body || "";
+
+                  // Resolve account key from identity
+                  let accountKey = "";
+                  try {
+                    for (const account of MailServices.accounts.accounts) {
+                      for (let i = 0; i < account.identities.length; i++) {
+                        if (account.identities[i].key === identity.key) {
+                          accountKey = account.key;
+                          break;
+                        }
+                      }
+                      if (accountKey) break;
+                    }
+                  } catch {}
+
+                  const listener = {
+                    QueryInterface: ChromeUtils.generateQI(["nsIMsgSendListener"]),
+                    onStartSending() {},
+                    onProgress() {},
+                    onStatus() {},
+                    onStopSending(msgID, status) {
+                      if (Components.isSuccessCode(status)) {
+                        resolve({ success: true, message: "Message sent" });
+                      } else {
+                        resolve({ error: `Send failed (status: 0x${status.toString(16)})` });
+                      }
+                    },
+                    onGetDraftFolderURI() {},
+                    onSendNotPerformed(msgID, status) {
+                      resolve({ error: "Send was not performed" });
+                    },
+                    onTransportSecurityError(msgID, status, secInfo, location) {
+                      resolve({ error: `Transport security error${location ? ": " + location : ""}` });
+                    },
+                  };
+
+                  msgSend.createAndSendMessage(
+                    null,                           // editor
+                    identity,                       // identity
+                    accountKey,                     // account key
+                    composeFields,                  // fields
+                    false,                          // isDigest
+                    false,                          // dontDeliver
+                    Ci.nsIMsgCompDeliverMode.Now,   // deliver mode
+                    null,                           // msgToReplace
+                    "text/html",                    // body type
+                    body,                           // body
+                    attachArray,                    // attachments
+                    null,                           // preloaded attachments
+                    null,                           // parent window
+                    null,                           // progress
+                    listener,                       // listener
+                    "",                             // password
+                    originalMsgURI || "",           // original msg URI
+                    compType                        // compose type
+                  );
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
             }
 
             function escapeHtml(s) {
@@ -2552,18 +2645,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	            }
 
             /**
-             * Opens a compose window with pre-filled fields.
+             * Composes a new email. Opens a compose window for review, or sends
+             * directly when skipReview is true.
              *
              * HTML body handling quirks:
              * 1. Strip newlines from HTML - Thunderbird adds <br> for each \n
              * 2. Encode non-ASCII as HTML entities - compose window has charset issues
              *    with emojis/unicode even with <meta charset="UTF-8">
              */
-            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments) {
+            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview) {
               try {
-                const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                  .getService(Ci.nsIMsgComposeService);
-
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
 
@@ -2592,6 +2683,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
+                if (skipReview) {
+                  return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New).then(result => {
+                    if (result.success) {
+                      let msg = "Message sent";
+                      if (identityWarning) msg += ` (${identityWarning})`;
+                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
+                      result.message = msg;
+                    }
+                    return result;
+                  });
+                }
+
+                const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
+                  .getService(Ci.nsIMsgComposeService);
                 msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
                 injectAttachmentsAsync(fileDescs);
@@ -2606,13 +2711,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Opens a reply compose window for a message with quoted original.
+             * Replies to a message with quoted original. Opens a compose window
+             * for review, or sends directly when skipReview is true.
              *
              * Uses nsIMsgCompType.New to preserve our body content, then manually
              * builds the quoted original message text. Threading is maintained
              * via the References and In-Reply-To headers.
              */
-	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments) {
+	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview) {
 	              return new Promise((resolve) => {
 	                try {
 	                  const found = findMessage(messageId, folderPath);
@@ -2630,9 +2736,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
                     try {
                       const originalBody = extractPlainTextBody(aMimeMsg);
-
-                      const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                        .getService(Ci.nsIMsgComposeService);
 
                       const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                         .createInstance(Ci.nsIMsgComposeParams);
@@ -2707,6 +2810,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       if (identityResult && identityResult.error) { resolve(identityResult); return; }
                       const identityWarning = identityResult || "";
 
+                      if (skipReview) {
+                        const msgURI = folder.getUriForMsg(msgHdr);
+                        const compType = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
+                        sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType).then(result => {
+                          if (result.success) {
+                            let msg = "Reply sent";
+                            if (identityWarning) msg += ` (${identityWarning})`;
+                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
+                            result.message = msg;
+                          }
+                          resolve(result);
+                        });
+                        return;
+                      }
+
+                      const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
+                        .getService(Ci.nsIMsgComposeService);
                       msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
                       injectAttachmentsAsync(fileDescs);
@@ -2727,10 +2847,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Opens a forward compose window with attachments preserved.
+             * Forwards a message with original content and attachments. Opens a
+             * compose window for review, or sends directly when skipReview is true.
              * Uses New type with manual forward quote to preserve both intro body and forwarded content.
              */
-	            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments) {
+	            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
 	              return new Promise((resolve) => {
 	                try {
 	                  const found = findMessage(messageId, folderPath);
@@ -2747,9 +2868,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                   MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
                     try {
-                      const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                        .getService(Ci.nsIMsgComposeService);
-
                       const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                         .createInstance(Ci.nsIMsgComposeParams);
 
@@ -2809,11 +2927,29 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       if (identityResult && identityResult.error) { resolve(identityResult); return; }
                       const identityWarning = identityResult || "";
 
+                      const allDescs = [...origDescs, ...fileDescs];
+
+                      if (skipReview) {
+                        const msgURI = folder.getUriForMsg(msgHdr);
+                        sendMessageDirectly(composeFields, msgComposeParams.identity, allDescs, msgURI, Ci.nsIMsgCompType.ForwardInline).then(result => {
+                          if (result.success) {
+                            let msg = `Forward sent with ${allDescs.length} attachment(s)`;
+                            if (identityWarning) msg += ` (${identityWarning})`;
+                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
+                            result.message = msg;
+                          }
+                          resolve(result);
+                        });
+                        return;
+                      }
+
+                      const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
+                        .getService(Ci.nsIMsgComposeService);
                       msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
-                      injectAttachmentsAsync([...origDescs, ...fileDescs]);
+                      injectAttachmentsAsync(allDescs);
 
-                      let msg = `Forward window opened with ${origDescs.length + fileDescs.length} attachment(s)`;
+                      let msg = `Forward window opened with ${allDescs.length} attachment(s)`;
                       if (identityWarning) msg += ` (${identityWarning})`;
                       if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                       resolve({ success: true, message: msg });
@@ -4019,11 +4155,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "createTask":
                   return createTask(args.title, args.dueDate, args.calendarId);
                 case "sendMail":
-                  return composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
+                  return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
                 case "replyToMessage":
-                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments);
+                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
                 case "forwardMessage":
-                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
+                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
                 case "getRecentMessages":
                   return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
                 case "displayMessage":
