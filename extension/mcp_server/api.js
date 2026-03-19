@@ -1283,12 +1283,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (text) return text;
               } catch { /* fall through */ }
               try {
-                function findBody(part) {
+                function findBody(part, isRoot = false) {
                   const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
-                  // Skip nested messages (attached emails) -- their body is not ours
-                  if (ct === "message/rfc822") return null;
-                  if (ct === "text/plain" && part.body) return { text: part.body, isHtml: false };
-                  if (ct === "text/html" && part.body) return { text: part.body, isHtml: true };
+                  // Skip nested messages (attached emails) -- their body is not ours.
+                  // Allow the root message/rfc822 so we recurse into its children.
+                  if (ct === "message/rfc822" && !isRoot) return null;
+                  if (ct !== "message/rfc822") {
+                    if (ct === "text/plain" && part.body) return { text: part.body, isHtml: false };
+                    if (ct === "text/html" && part.body) return { text: part.body, isHtml: true };
+                  }
                   if (part.parts) {
                     let htmlFallback = null;
                     for (const sub of part.parts) {
@@ -1300,7 +1303,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                   return null;
                 }
-                const found = findBody(aMimeMsg);
+                const found = findBody(aMimeMsg, true);
                 if (found) return found.isHtml ? stripHtml(found.text) : found.text;
               } catch { /* give up */ }
               return "";
