@@ -1260,6 +1260,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * no reliable way to target a specific window. Injection failures are
              * silent (callers report success based on pre-validated descriptor counts).
              */
+            /**
+             * Converts attachment descriptors to nsIMsgAttachment objects.
+             * Shared by injectAttachmentsAsync (compose window) and
+             * sendMessageDirectly (headless send).
+             */
+            function descsToMsgAttachments(attachDescs) {
+              const result = [];
+              for (const desc of attachDescs) {
+                try {
+                  const att = Cc["@mozilla.org/messengercompose/attachment;1"]
+                    .createInstance(Ci.nsIMsgAttachment);
+                  att.url = desc.url;
+                  att.name = desc.name;
+                  if (desc.size != null) att.size = desc.size;
+                  if (desc.contentType) att.contentType = desc.contentType;
+                  result.push(att);
+                } catch {}
+              }
+              return result;
+            }
+
             function injectAttachmentsAsync(attachDescs) {
               if (!attachDescs || attachDescs.length === 0) return;
               const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
@@ -1270,18 +1291,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   try {
                     const composeWin = Services.wm.getMostRecentWindow("msgcompose");
                     if (!composeWin || typeof composeWin.AddAttachments !== "function") return;
-                    const attachList = [];
-                    for (const desc of attachDescs) {
-                      try {
-                        const att = Cc["@mozilla.org/messengercompose/attachment;1"]
-                          .createInstance(Ci.nsIMsgAttachment);
-                        att.url = desc.url;
-                        att.name = desc.name;
-                        if (desc.size != null) att.size = desc.size;
-                        if (desc.contentType) att.contentType = desc.contentType;
-                        attachList.push(att);
-                      } catch {}
-                    }
+                    const attachList = descsToMsgAttachments(attachDescs);
                     if (attachList.length > 0) {
                       composeWin.AddAttachments(attachList);
                     }
@@ -1327,17 +1337,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const msgSend = Cc["@mozilla.org/messengercompose/send;1"]
                     .createInstance(Ci.nsIMsgSend);
 
+                  // Populate sender fields from identity (normally done by compose window)
+                  if (identity.email) {
+                    const name = identity.fullName || "";
+                    composeFields.from = name
+                      ? `"${name}" <${identity.email}>`
+                      : identity.email;
+                  }
+                  if (identity.organization) {
+                    composeFields.organization = identity.organization;
+                  }
+
                   // Add attachments to composeFields (works in all TB versions)
-                  for (const desc of attachDescs) {
-                    try {
-                      const att = Cc["@mozilla.org/messengercompose/attachment;1"]
-                        .createInstance(Ci.nsIMsgAttachment);
-                      att.url = desc.url;
-                      att.name = desc.name;
-                      if (desc.size != null) att.size = desc.size;
-                      if (desc.contentType) att.contentType = desc.contentType;
-                      composeFields.addAttachment(att);
-                    } catch {}
+                  for (const att of descsToMsgAttachments(attachDescs)) {
+                    composeFields.addAttachment(att);
                   }
 
                   // Extract body -- createAndSendMessage takes it as a separate param
@@ -1407,13 +1420,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   ];
 
                   // Try modern 16-arg signature first (TB 128+).
-                  // On TB 102-127 this throws NS_ERROR_XPC_NOT_ENOUGH_ARGS,
-                  // so we fall back to legacy 18-arg with null attachment params
-                  // (attachments already on composeFields).
+                  // On TB 102-127, XPCOM throws NS_ERROR_XPC_NOT_ENOUGH_ARGS
+                  // (0x80570001), so we fall back to legacy 18-arg with null
+                  // attachment params (attachments already on composeFields).
+                  // Modern TB may return a Promise -- catch async rejections.
+                  let sendResult;
                   try {
-                    msgSend.createAndSendMessage(...commonArgs, ...tailArgs);
-                  } catch {
-                    msgSend.createAndSendMessage(...commonArgs, null, null, ...tailArgs);
+                    sendResult = msgSend.createAndSendMessage(...commonArgs, ...tailArgs);
+                  } catch (e) {
+                    const isArgError = (e && e.result === 0x80570001) ||
+                      String(e).includes("Not enough arguments");
+                    if (isArgError) {
+                      sendResult = msgSend.createAndSendMessage(...commonArgs, null, null, ...tailArgs);
+                    } else {
+                      throw e;
+                    }
+                  }
+                  // Handle async Promise from modern TB (128+)
+                  if (sendResult && typeof sendResult.catch === "function") {
+                    sendResult.catch(e => {
+                      timer.cancel();
+                      settle({ error: e.toString() });
+                    });
                   }
                 } catch (e) {
                   timer.cancel();
@@ -1575,15 +1603,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Extracts raw body content from a MIME message.
+             * Walks the MIME tree to find the raw body content.
              * Returns { text, isHtml } without any format conversion.
+             * Does NOT use coerceBodyToPlaintext -- callers that want
+             * the raw HTML (for markdown/html output) need this.
              */
             function extractBodyContent(aMimeMsg) {
               if (!aMimeMsg) return { text: "", isHtml: false };
-              try {
-                const text = aMimeMsg.coerceBodyToPlaintext();
-                if (text) return { text, isHtml: false };
-              } catch { /* fall through */ }
               try {
                 function findBody(part, isRoot = false) {
                   const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
@@ -1611,29 +1637,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             /**
              * Extracts plain text body from a MIME message.
-             * Tries coerceBodyToPlaintext first, then walks MIME tree for HTML fallback.
+             * Uses coerceBodyToPlaintext as fast path, then MIME tree fallback.
+             * Used by reply/forward quoting where plain text is appropriate.
              */
             function extractPlainTextBody(aMimeMsg) {
+              if (!aMimeMsg) return "";
+              try {
+                const text = aMimeMsg.coerceBodyToPlaintext();
+                if (text) return text;
+              } catch { /* fall through */ }
               const { text, isHtml } = extractBodyContent(aMimeMsg);
               return isHtml ? stripHtml(text) : text;
             }
 
             /**
              * Extracts body from a MIME message in the requested format.
-             * Returns { body, bodyIsHtml } for use in getMessage.
+             * For "text": uses coerceBodyToPlaintext fast path (original behavior).
+             * For "markdown"/"html": walks MIME tree to find raw HTML content.
              */
             function extractFormattedBody(aMimeMsg, bodyFormat) {
-              const { text, isHtml } = extractBodyContent(aMimeMsg);
-              if (!isHtml) return { body: text, bodyIsHtml: false };
-              switch (bodyFormat) {
-                case "html":
-                  return { body: text, bodyIsHtml: true };
-                case "text":
-                  return { body: stripHtml(text), bodyIsHtml: false };
-                case "markdown":
-                default:
-                  return { body: htmlToMarkdown(text), bodyIsHtml: false };
+              if (bodyFormat === "text") {
+                return { body: extractPlainTextBody(aMimeMsg), bodyIsHtml: false };
               }
+              // For markdown/html: need raw MIME content, not coerced text
+              const { text, isHtml } = extractBodyContent(aMimeMsg);
+              if (!text) {
+                // MIME tree empty -- try coerce as last resort
+                const fallback = extractPlainTextBody(aMimeMsg);
+                return { body: fallback, bodyIsHtml: false };
+              }
+              if (!isHtml) return { body: text, bodyIsHtml: false };
+              if (bodyFormat === "html") return { body: text, bodyIsHtml: true };
+              // Default: markdown
+              return { body: htmlToMarkdown(text), bodyIsHtml: false };
             }
 
             /**
