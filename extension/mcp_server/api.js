@@ -1124,13 +1124,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Finds an identity by email address or identity ID.
-             * Returns null if not found.
+             * Searches the given accounts for an identity matching emailOrId
+             * (by key or case-insensitive email).
+             * Returns the identity object, or null if not found.
              */
-            function findIdentity(emailOrId) {
+            function findIdentityIn(accounts, emailOrId) {
               if (!emailOrId) return null;
               const lowerInput = emailOrId.toLowerCase();
-              for (const account of getAccessibleAccounts()) {
+              for (const account of accounts) {
                 for (const identity of account.identities) {
                   if (identity.key === emailOrId || (identity.email || "").toLowerCase() === lowerInput) {
                     return identity;
@@ -1138,6 +1139,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
               return null;
+            }
+
+            /**
+             * Finds an identity by email address or identity ID
+             * among accessible accounts only.  Returns null if not found.
+             */
+            function findIdentity(emailOrId) {
+              return findIdentityIn(getAccessibleAccounts(), emailOrId);
             }
 
             /** Creates an nsIFile instance for the given path. */
@@ -1687,31 +1696,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             /**
              * Sets compose identity from `from` param or falls back to default.
-             * Returns warning string if `from` was specified but not found.
+             * Returns "" on success, or { error } if `from` was explicitly
+             * provided but not found / restricted.  Fallback to default only
+             * applies when `from` is omitted.
              */
             function setComposeIdentity(msgComposeParams, from, fallbackServer) {
-              const identity = findIdentity(from);
-              let isRestricted = false;
-              if (identity) {
-                // Verify the identity's account is accessible
-                for (const account of MailServices.accounts.accounts) {
-                  const identities = account.identities;
-                  for (let i = 0; i < identities.length; i++) {
-                    if (identities[i].key === identity.key) {
-                      if (!isAccountAllowed(account.key)) {
-                        isRestricted = true;
-                      }
-                      break;
-                    }
-                  }
-                }
-                if (!isRestricted) {
+              if (from) {
+                // Explicit `from` -- must resolve or fail, never silently substitute
+                const identity = findIdentity(from);
+                if (identity) {
+                  // findIdentity searches accessible accounts, so this is safe
                   msgComposeParams.identity = identity;
                   return "";
                 }
-                // Restricted -- fall through to default identity resolution
+                // Not found in accessible accounts -- check ALL accounts to
+                // distinguish "restricted" from "genuinely unknown"
+                if (findIdentityIn(MailServices.accounts.accounts, from)) {
+                  return { error: `identity ${from} belongs to a restricted account` };
+                }
+                return { error: `unknown identity: ${from} -- no matching account configured in Thunderbird` };
               }
-              // Fallback to default identity for the account
+              // No explicit `from` -- fall back to contextual default
               if (fallbackServer) {
                 const account = MailServices.accounts.findAccountForServer(fallbackServer);
                 if (account && isAccountAllowed(account.key)) {
@@ -1738,8 +1743,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "No accessible identity found -- all accounts are restricted" };
                 }
               }
-              if (isRestricted) return `identity ${from} belongs to restricted account, using default`;
-              return from ? `unknown identity: ${from}, using accessible default` : "";
+              return "";
             }
 
 	            /**
@@ -2884,7 +2888,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const identityResult = setComposeIdentity(msgComposeParams, from, null);
                 if (identityResult && identityResult.error) return identityResult;
-                const identityWarning = identityResult || "";
 
                 const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
@@ -2892,7 +2895,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New).then(result => {
                     if (result.success) {
                       let msg = "Message sent";
-                      if (identityWarning) msg += ` (${identityWarning})`;
                       if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                       result.message = msg;
                     }
@@ -2907,7 +2909,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 injectAttachmentsAsync(fileDescs);
 
                 let msg = "Compose window opened";
-                if (identityWarning) msg += ` (${identityWarning})`;
                 if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                 return { success: true, message: msg };
               } catch (e) {
@@ -3013,7 +3014,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                       const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
                       if (identityResult && identityResult.error) { resolve(identityResult); return; }
-                      const identityWarning = identityResult || "";
 
                       if (skipReview) {
                         const msgURI = folder.getUriForMsg(msgHdr);
@@ -3021,7 +3021,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType).then(result => {
                           if (result.success) {
                             let msg = "Reply sent";
-                            if (identityWarning) msg += ` (${identityWarning})`;
                             if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                             result.message = msg;
                           }
@@ -3037,7 +3036,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       injectAttachmentsAsync(fileDescs);
 
                       let msg = "Reply window opened";
-                      if (identityWarning) msg += ` (${identityWarning})`;
                       if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                       resolve({ success: true, message: msg });
                     } catch (e) {
@@ -3130,7 +3128,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                       const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
                       if (identityResult && identityResult.error) { resolve(identityResult); return; }
-                      const identityWarning = identityResult || "";
 
                       const allDescs = [...origDescs, ...fileDescs];
 
@@ -3139,7 +3136,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         sendMessageDirectly(composeFields, msgComposeParams.identity, allDescs, msgURI, Ci.nsIMsgCompType.ForwardInline).then(result => {
                           if (result.success) {
                             let msg = `Forward sent with ${allDescs.length} attachment(s)`;
-                            if (identityWarning) msg += ` (${identityWarning})`;
                             if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                             result.message = msg;
                           }
@@ -3155,7 +3151,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       injectAttachmentsAsync(allDescs);
 
                       let msg = `Forward window opened with ${allDescs.length} attachment(s)`;
-                      if (identityWarning) msg += ` (${identityWarning})`;
                       if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                       resolve({ success: true, message: msg });
                     } catch (e) {
