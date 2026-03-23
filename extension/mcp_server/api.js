@@ -118,6 +118,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             saveAttachments: { type: "boolean", description: "If true, save attachments to <OS temp dir>/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" },
             bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format: 'markdown' (default, preserves structure), 'text' (plain text), 'html' (raw HTML)" },
+            rawSource: { type: "boolean", description: "If true, return the full raw RFC 2822 message source (all headers + MIME parts). Useful for extracting calendar invites, S/MIME data, or debugging. Other fields (body, attachments) are omitted when this is set." },
           },
           required: ["messageId", "folderPath"],
         },
@@ -2795,7 +2796,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat) {
+	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource) {
 	              return new Promise((resolve) => {
 	                try {
 	                  const found = findMessage(messageId, folderPath);
@@ -2804,6 +2805,29 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    return;
 	                  }
 	                  const { msgHdr } = found;
+
+	                  // Raw source mode: return full RFC 2822 message
+	                  if (rawSource) {
+	                    try {
+	                      const folder = msgHdr.folder;
+	                      const stream = folder.getMsgInputStream(msgHdr, {});
+	                      const messageSize = folder.hasMsgOffline(msgHdr.messageKey)
+	                        ? msgHdr.offlineMessageSize
+	                        : msgHdr.messageSize;
+	                      // No charset specified -- defaults to Latin-1 which
+	                      // preserves raw bytes. UTF-8 would corrupt messages
+	                      // with 8-bit content.
+	                      const raw = NetUtil.readInputStreamToString(stream, messageSize);
+	                      resolve({
+	                        id: msgHdr.messageId,
+	                        subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
+	                        rawSource: raw,
+	                      });
+	                    } catch (e) {
+	                      resolve({ error: `Failed to read raw source: ${e}` });
+	                    }
+	                    return;
+	                  }
 
 	                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
 	                    "resource:///modules/gloda/MimeMessage.sys.mjs"
@@ -4573,7 +4597,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "searchMessages":
                   return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
                 case "getMessage":
-                  return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat);
+                  return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
                 case "createContact":
