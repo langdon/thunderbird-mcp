@@ -1,11 +1,11 @@
 # Thunderbird MCP
 
-[![Tools](https://img.shields.io/badge/36_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/35_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
 
-Give your AI assistant full access to Thunderbird — search mail, compose messages, manage filters, and organize your inbox. All through the [Model Context Protocol](https://modelcontextprotocol.io/).
+Give your AI assistant full access to Thunderbird -- search mail, compose messages, manage filters, and organize your inbox. All through the [Model Context Protocol](https://modelcontextprotocol.io/).
 
 <p align="center">
   <img src="docs/demo.gif" alt="Thunderbird MCP Demo" width="600">
@@ -17,7 +17,7 @@ Give your AI assistant full access to Thunderbird — search mail, compose messa
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 36 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 35 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Compose tools open a review window before sending by default. Set `skipReview` to send directly when you've already approved the content upstream. **Nothing gets sent without your approval.**
 
@@ -42,9 +42,9 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | Tool | Description |
 |------|-------------|
 | `listAccounts` | List all email accounts and their identities |
-| `listFolders` | Browse folder tree with message counts — filter by account or subtree |
-| `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. |
-| `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Optional attachment saving. Includes inline CID images. |
+| `listFolders` | Browse folder tree with message counts -- filter by account or subtree |
+| `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Set `searchBody: true` for full-text body search via Thunderbird's Gloda index. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. |
+| `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Set `rawSource: true` for the complete RFC 2822 source (all headers + MIME parts). Optional attachment saving. Includes inline CID images. |
 | `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
 | `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
 | `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move between folders, or trash -- supports bulk via `messageIds` |
@@ -66,6 +66,8 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 
 All compose tools open a window for you to review and edit before sending by default. Set `skipReview: true` to send directly when you've already approved the content. Attachments can be file paths or inline base64 objects.
 
+Compose tools validate the `from` identity strictly -- if the specified sender doesn't match any configured Thunderbird identity, the tool returns an error instead of silently substituting another account.
+
 ### Filters
 
 | Tool | Description |
@@ -75,7 +77,7 @@ All compose tools open a window for you to review and edit before sending by def
 | `updateFilter` | Modify a filter's name, enabled state, conditions, or actions |
 | `deleteFilter` | Remove a filter by index |
 | `reorderFilters` | Change filter execution priority |
-| `applyFilters` | Run filters on a folder on demand — let your AI organize your inbox |
+| `applyFilters` | Run filters on a folder on demand -- let your AI organize your inbox |
 
 Full control over Thunderbird's message filters. Changes persist immediately. Your AI can create sorting rules, adjust priorities, and run them on existing mail.
 
@@ -98,6 +100,7 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 | `updateEvent` | Modify an event's title, dates, location, or description |
 | `deleteEvent` | Delete a calendar event by ID |
 | `createTask` | Open a pre-filled task dialog for review |
+| `listTasks` | List tasks/to-dos from calendars -- filter by completion status, due date, or calendar |
 
 ### Access Control
 
@@ -117,7 +120,7 @@ Account and tool access are configured via the extension settings page (Tools > 
 git clone https://github.com/TKasperczyk/thunderbird-mcp.git
 ```
 
-Install `dist/thunderbird-mcp.xpi` in Thunderbird (Tools > Add-ons > Install from File), then restart. A pre-built XPI is included in the repo — no build step needed.
+Install `dist/thunderbird-mcp.xpi` in Thunderbird (Tools > Add-ons > Install from File), then restart. A pre-built XPI is included in the repo -- no build step needed.
 
 ### 2. Configure your MCP client
 
@@ -156,6 +159,8 @@ That's it. Your AI can now access Thunderbird.
 | Connection refused | Make sure Thunderbird is running and the extension is enabled |
 | Missing recent emails | IMAP folders can be stale. Click the folder in Thunderbird to sync, or right-click > Properties > Repair Folder |
 | Tool not found after update | Reconnect MCP (`/mcp` in Claude Code) to pick up new tools |
+| `searchBody` returns no results | IMAP accounts need offline sync enabled for Gloda to index message bodies |
+| `rawSource` fails on IMAP | Requires local/offline message copy. Enable offline sync or click the message first to cache it. |
 
 ---
 
@@ -205,12 +210,13 @@ thunderbird-mcp/
 ## Known issues
 
 - IMAP folder databases can be stale until you click on them in Thunderbird
-- Email bodies with control characters are sanitized to avoid breaking JSON
 - HTML-only emails are converted to plain text (original formatting is lost)
 - Recurring calendar event CRUD operates on the series, not individual occurrences
 - IMAP folder operations (rename, delete, move) are async -- verify with `listFolders` after
 - Combining tags with move/trash on IMAP may not preserve tags on the moved copy -- use separate calls
 - Pre-existing Thunderbird filters with cross-account move/copy targets are not restricted by account access control
+- `searchBody` on IMAP without offline sync only searches headers (Gloda limitation)
+- `rawSource` requires offline message copy for IMAP -- online-only messages will error
 
 ---
 
