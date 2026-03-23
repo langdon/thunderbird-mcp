@@ -118,7 +118,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             saveAttachments: { type: "boolean", description: "If true, save attachments to <OS temp dir>/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" },
             bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format: 'markdown' (default, preserves structure), 'text' (plain text), 'html' (raw HTML)" },
-            rawSource: { type: "boolean", description: "If true, return the full raw RFC 2822 message source (all headers + MIME parts). Useful for extracting calendar invites, S/MIME data, or debugging. Other fields (body, attachments) are omitted when this is set." },
+            rawSource: { type: "boolean", description: "If true, return the full raw RFC 2822 message source (all headers + MIME parts). Useful for extracting calendar invites, S/MIME data, or debugging. Other fields (body, attachments) are omitted when this is set. Note: requires local/offline message copy; IMAP messages not cached offline may fail." },
           },
           required: ["messageId", "folderPath"],
         },
@@ -1893,13 +1893,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const parsedEndDate = endDate ? new Date(endDate).getTime() : null;
               if (parsedStartDate !== null && isNaN(parsedStartDate)) return { error: `Invalid startDate: ${startDate}` };
               if (parsedEndDate !== null && isNaN(parsedEndDate)) return { error: `Invalid endDate: ${endDate}` };
+              // Match the regular search path: expand date-only endDate to end of day
+              const isDateOnly = endDate && /^\d{4}-\d{2}-\d{2}$/.test(endDate.trim());
+              const endDateOffset = isDateOnly ? 86400000 : 0;
+              const endDateTs = parsedEndDate !== null ? (parsedEndDate + endDateOffset) * 1000 : null;
+              const startDateTs = parsedStartDate !== null ? parsedStartDate * 1000 : null;
 
-              // Resolve folder filter upfront
-              let folderFilter = null;
+              // Resolve folder filter upfront -- match by URI prefix for subfolder inclusion
+              let folderFilterURI = null;
               if (folderPath) {
                 const result = getAccessibleFolder(folderPath);
                 if (result.error) return result;
-                folderFilter = result.folder;
+                folderFilterURI = result.folder.URI;
               }
 
               return new Promise((resolve) => {
@@ -1925,13 +1930,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           if (!folder) continue;
                           if (!isFolderAccessible(folder)) continue;
 
-                          // Folder filter
-                          if (folderFilter && folder.URI !== folderFilter.URI) continue;
+                          // Folder filter (URI prefix match includes subfolders)
+                          if (folderFilterURI && !folder.URI.startsWith(folderFilterURI)) continue;
 
-                          // Date filters
+                          // Date filters (timestamps in microseconds)
                           const msgDateTs = msgHdr.date || 0;
-                          if (parsedStartDate !== null && msgDateTs < parsedStartDate * 1000) continue;
-                          if (parsedEndDate !== null && msgDateTs > parsedEndDate * 1000) continue;
+                          if (startDateTs !== null && msgDateTs < startDateTs) continue;
+                          if (endDateTs !== null && msgDateTs > endDateTs) continue;
 
                           // Boolean filters
                           if (unreadOnly && msgHdr.isRead) continue;
@@ -2808,9 +2813,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
 	                  // Raw source mode: return full RFC 2822 message
 	                  if (rawSource) {
+	                    let stream = null;
 	                    try {
 	                      const folder = msgHdr.folder;
-	                      const stream = folder.getMsgInputStream(msgHdr, {});
+	                      stream = folder.getMsgInputStream(msgHdr, {});
 	                      const messageSize = folder.hasMsgOffline(msgHdr.messageKey)
 	                        ? msgHdr.offlineMessageSize
 	                        : msgHdr.messageSize;
@@ -2825,6 +2831,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                      });
 	                    } catch (e) {
 	                      resolve({ error: `Failed to read raw source: ${e}` });
+	                    } finally {
+	                      if (stream) try { stream.close(); } catch { /* ignore */ }
 	                    }
 	                    return;
 	                  }
