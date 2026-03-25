@@ -1498,6 +1498,12 @@ RequestReader.prototype = {
           : 0;
         dumpn("_processHeaders, Content-length=" + this._contentLength);
 
+        // Reject oversized request bodies before buffering into memory.
+        // 10 MB is generous for JSON-RPC MCP requests.
+        if (this._contentLength > 10 * 1024 * 1024) {
+          throw HTTP_413;
+        }
+
         this._state = READER_IN_BODY;
       }
       return done;
