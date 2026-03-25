@@ -3024,7 +3024,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           file.append(safeName);
 
                           try {
-                            file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o644);
+                            file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
                           } catch (e) {
                             info.error = `Failed to create file: ${e}`;
                             done();
@@ -4681,13 +4681,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             server.registerPathHandler("/", (req, res) => {
               res.processAsync();
 
-              if (req.method !== "POST") {
-                res.setStatusLine("1.1", 200, "OK");
+              // Verify auth token on ALL requests (including non-POST) to
+              // prevent unauthenticated probing of the server.
+              let reqToken = "";
+              try {
+                reqToken = req.getHeader("Authorization") || "";
+              } catch {
+                // getHeader throws if header is missing in httpd.sys.mjs
+              }
+              if (!timingSafeEqual(reqToken, `Bearer ${authToken}`)) {
+                res.setStatusLine("1.1", 403, "Forbidden");
                 res.setHeader("Content-Type", "application/json; charset=utf-8", false);
                 res.write(JSON.stringify({
                   jsonrpc: "2.0",
                   id: null,
-                  error: { code: -32600, message: "Invalid Request" }
+                  error: { code: -32600, message: "Invalid or missing auth token" }
+                }));
+                res.finish();
+                return;
+              }
+
+              if (req.method !== "POST") {
+                res.setStatusLine("1.1", 405, "Method Not Allowed");
+                res.setHeader("Allow", "POST", false);
+                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                res.write(JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32600, message: "Method not allowed" }
                 }));
                 res.finish();
                 return;
@@ -4707,25 +4728,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   jsonrpc: "2.0",
                   id: null,
                   error: { code: -32600, message: "Request body too large" }
-                }));
-                res.finish();
-                return;
-              }
-
-              // Verify auth token from Authorization header
-              let reqToken = "";
-              try {
-                reqToken = req.getHeader("Authorization") || "";
-              } catch {
-                // getHeader throws if header is missing in httpd.sys.mjs
-              }
-              if (!timingSafeEqual(reqToken, `Bearer ${authToken}`)) {
-                res.setStatusLine("1.1", 403, "Forbidden");
-                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
-                res.write(JSON.stringify({
-                  jsonrpc: "2.0",
-                  id: null,
-                  error: { code: -32600, message: "Invalid or missing auth token" }
                 }));
                 res.finish();
                 return;
