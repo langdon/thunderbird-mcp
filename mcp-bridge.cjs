@@ -14,7 +14,8 @@ const os = require('os');
 
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
-const CONNECTION_FILE = path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json');
+const CONNECTION_FILE = process.env.THUNDERBIRD_MCP_CONNECTION_FILE
+  || path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json');
 const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
 
