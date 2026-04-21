@@ -3046,23 +3046,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           // No charset specified -- defaults to Latin-1 which
                           // preserves raw bytes for later transfer decoding.
                           const rawContent = NetUtil.readInputStreamToString(rawStream, rawSize);
-                          let headerEnd = rawContent.indexOf("\r\n\r\n");
-                          let bodyStart = headerEnd >= 0 ? headerEnd + 4 : -1;
-                          if (headerEnd < 0) {
-                            headerEnd = rawContent.indexOf("\n\n");
-                            bodyStart = headerEnd >= 0 ? headerEnd + 2 : -1;
-                          }
+                          // Find header/body boundary. Prefer CRLFCRLF (RFC 5322),
+                          // then LFLF (LF-normalized mbox), then CRCR (legacy
+                          // classic Mac exports). Pick the earliest match so a
+                          // stray LFLF inside CRLF-separated headers doesn't win.
+                          const boundaryMatch = rawContent.match(/\r\n\r\n|\n\n|\r\r/);
+                          const headerEnd = boundaryMatch ? boundaryMatch.index : -1;
+                          const bodyStart = boundaryMatch
+                            ? boundaryMatch.index + boundaryMatch[0].length
+                            : -1;
                           if (bodyStart < 0) {
                             console.error(`${fallbackContext}: could not find header/body boundary`);
                           } else {
                             const headerBlock = rawContent.slice(0, headerEnd);
                             const rawBody = rawContent.slice(bodyStart);
+                            // Unfold continuation lines for all three line-ending flavors.
                             const unfoldedHeaders = headerBlock
-                              .replace(/\r\n[ \t]+/g, " ")
-                              .replace(/\n[ \t]+/g, " ");
+                              .replace(/(?:\r\n|\r|\n)[ \t]+/g, " ");
                             let contentTypeHeader = "";
                             let transferEncodingHeader = "";
-                            for (const line of unfoldedHeaders.split(/\r?\n/)) {
+                            for (const line of unfoldedHeaders.split(/\r\n|\r|\n/)) {
                               const colonIdx = line.indexOf(":");
                               if (colonIdx < 0) continue;
                               const headerName = line.slice(0, colonIdx).trim().toLowerCase();
@@ -3086,7 +3089,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                               let bodyBytes = null;
 
                               if (transferEncoding === "quoted-printable") {
-                                const qpBody = rawBody.replace(/=\r\n/g, "").replace(/=\n/g, "");
+                                // Remove quoted-printable soft breaks: =CRLF, =LF, =CR.
+                                const qpBody = rawBody.replace(/=(?:\r\n|\r|\n)/g, "");
                                 const decodedBytes = [];
                                 for (let i = 0; i < qpBody.length; i++) {
                                   if (qpBody[i] === "=" && i + 2 < qpBody.length) {
