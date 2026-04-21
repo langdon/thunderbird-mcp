@@ -2524,6 +2524,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
                 if (!calendar) return { error: `Calendar not found: ${calendarId}` };
                 if (calendar.readOnly) return { error: `Calendar is read-only: ${calendar.name}` };
+                if (calendar.getProperty("capabilities.tasks.supported") === false) {
+                  return { error: `Calendar "${calendar.name}" does not support tasks. Use listCalendars to find one with supportsTasks=true.` };
+                }
 
                 // Try direct lookup first, then fall back to scanning all tasks
                 let oldItem = null;
@@ -2613,7 +2616,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (changes.length === 0) return { error: "No changes specified" };
 
                 await calendar.modifyItem(newItem, oldItem);
-                return { success: true, updated: changes, task: formatTask(newItem, calendar) };
+                const result = { success: true, updated: changes, task: formatTask(newItem, calendar) };
+                if (newItem.recurrenceInfo) {
+                  result.warning = "This is a recurring task -- changes apply to the entire series.";
+                }
+                return result;
               } catch (e) {
                 return { error: e.toString() };
               }
