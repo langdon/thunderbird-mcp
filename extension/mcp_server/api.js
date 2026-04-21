@@ -270,6 +270,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "updateTask",
+        group: "calendar", crud: "update",
+        title: "Update Task",
+        description: "Update an existing task/to-do: change title, due date, description, priority, completion status, or percent complete",
+        inputSchema: {
+          type: "object",
+          properties: {
+            taskId: { type: "string", description: "Task ID (from listTasks results)" },
+            calendarId: { type: "string", description: "Calendar ID containing the task (from listTasks results)" },
+            title: { type: "string", description: "New task title (optional)" },
+            dueDate: { type: "string", description: "New due date in ISO 8601 format (optional)" },
+            description: { type: "string", description: "New task description/body (optional)" },
+            completed: { type: "boolean", description: "Set to true to mark the task done (sets percentComplete=100 and records completedDate), false to reopen it (optional)" },
+            percentComplete: { type: "integer", description: "Completion percentage 0–100 (optional)" },
+            priority: { type: "integer", description: "Priority: 1=high, 5=normal, 9=low (optional)" },
+          },
+          required: ["taskId", "calendarId"],
+        },
+      },
+      {
         name: "searchContacts",
         group: "contacts", crud: "read",
         title: "Search Contacts",
@@ -2495,6 +2515,117 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               };
             }
 
+            async function updateTask(taskId, calendarId, title, dueDate, description, completed, percentComplete, priority) {
+              if (!cal) return { error: "Calendar not available" };
+              try {
+                if (!taskId) return { error: "taskId is required" };
+                if (!calendarId) return { error: "calendarId is required" };
+
+                const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
+                if (!calendar) return { error: `Calendar not found: ${calendarId}` };
+                if (calendar.readOnly) return { error: `Calendar is read-only: ${calendar.name}` };
+                if (calendar.getProperty("capabilities.tasks.supported") === false) {
+                  return { error: `Calendar "${calendar.name}" does not support tasks. Use listCalendars to find one with supportsTasks=true.` };
+                }
+
+                // Try direct lookup first, then fall back to scanning all tasks
+                let oldItem = null;
+                if (typeof calendar.getItem === "function") {
+                  try { oldItem = await calendar.getItem(taskId); } catch {}
+                }
+                if (!oldItem) {
+                  const FILTER_TODO = 1 << 2;
+                  const COMPLETED_YES = 1 << 0;
+                  const COMPLETED_NO = 1 << 1;
+                  let items;
+                  if (typeof calendar.getItemsAsArray === "function") {
+                    items = await calendar.getItemsAsArray(FILTER_TODO | COMPLETED_YES | COMPLETED_NO, 0, null, null);
+                  } else {
+                    items = [];
+                    const stream = cal.iterate.streamValues(calendar.getItems(FILTER_TODO | COMPLETED_YES | COMPLETED_NO, 0, null, null));
+                    for await (const chunk of stream) {
+                      for (const i of chunk) items.push(i);
+                    }
+                  }
+                  oldItem = items.find(i => i.id === taskId) || null;
+                }
+                if (!oldItem) return { error: `Task not found: ${taskId}` };
+
+                const newItem = oldItem.clone();
+                const changes = [];
+
+                if (title !== undefined) { newItem.title = title; changes.push("title"); }
+                if (description !== undefined) { newItem.setProperty("DESCRIPTION", description); changes.push("description"); }
+                if (priority !== undefined) { newItem.priority = priority; changes.push("priority"); }
+
+                if (dueDate !== undefined) {
+                  // Explicit null or empty string clears the due date.
+                  // Without this, `new Date(null).getTime() === 0` would
+                  // silently write Unix epoch (1970-01-01) instead.
+                  if (dueDate === null || dueDate === "") {
+                    newItem.dueDate = null;
+                  } else {
+                    const js = new Date(dueDate);
+                    if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
+                    if (/^\d{4}-\d{2}-\d{2}$/.test(dueDate.trim())) {
+                      const dt = cal.createDateTime();
+                      dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                      dt.isDate = true;
+                      newItem.dueDate = dt;
+                    } else {
+                      newItem.dueDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                    }
+                  }
+                  changes.push("dueDate");
+                }
+
+                // 'completed' and 'percentComplete' both control completion state.
+                // Reject ambiguous input rather than guessing precedence.
+                if (completed !== undefined && percentComplete !== undefined) {
+                  return { error: "Specify either 'completed' or 'percentComplete', not both" };
+                }
+
+                // Apply completion state keeping STATUS, PERCENT-COMPLETE, and
+                // COMPLETED consistent per iCal RFC 5545 VTODO rules -- so
+                // Thunderbird's UI and other consumers see a valid task state.
+                function applyCompletionState(pct) {
+                  const clamped = Math.min(100, Math.max(0, pct));
+                  newItem.percentComplete = clamped;
+                  if (clamped === 100) {
+                    newItem.setProperty("STATUS", "COMPLETED");
+                    newItem.completedDate = cal.dtz.jsDateToDateTime(new Date(), cal.dtz.defaultTimezone);
+                  } else if (clamped === 0) {
+                    newItem.setProperty("STATUS", "NEEDS-ACTION");
+                    newItem.completedDate = null;
+                  } else {
+                    newItem.setProperty("STATUS", "IN-PROCESS");
+                    newItem.completedDate = null;
+                  }
+                }
+
+                if (percentComplete !== undefined) {
+                  applyCompletionState(percentComplete);
+                  changes.push("percentComplete");
+                }
+
+                if (completed !== undefined) {
+                  applyCompletionState(completed ? 100 : 0);
+                  changes.push("completed");
+                }
+
+                if (changes.length === 0) return { error: "No changes specified" };
+
+                await calendar.modifyItem(newItem, oldItem);
+                const result = { success: true, updated: changes, task: formatTask(newItem, calendar) };
+                if (newItem.recurrenceInfo) {
+                  result.warning = "This is a recurring task -- changes apply to the entire series.";
+                }
+                return result;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             async function listEvents(calendarId, startDate, endDate, maxResults) {
               if (!cal) {
                 return { error: "Calendar not available" };
@@ -4554,6 +4685,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (typeof value !== "object" || Array.isArray(value)) {
                     errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
                   }
+                } else if (expectedType === "integer") {
+                  // JSON Schema "integer" is a whole number. typeof reports
+                  // "number" for both integers and floats, so check explicitly.
+                  if (typeof value !== "number" || !Number.isInteger(value)) {
+                    errors.push(`Parameter '${key}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
+                  }
                 } else if (expectedType && typeof value !== expectedType) {
                   errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
                 }
@@ -4586,6 +4723,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (value.trim() === "") continue;
                   const n = Number(value);
                   if (Number.isFinite(n)) args[key] = n;
+                } else if (expected === "integer" && typeof value === "string") {
+                  if (value.trim() === "") continue;
+                  const n = Number(value);
+                  if (Number.isFinite(n) && Number.isInteger(n)) args[key] = n;
                 } else if (expected === "array" && typeof value === "string") {
                   try {
                     const parsed = JSON.parse(value);
@@ -4628,6 +4769,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return createTask(args.title, args.dueDate, args.calendarId);
                 case "listTasks":
                   return await listTasks(args.calendarId, args.completed, args.dueBefore, args.maxResults);
+                case "updateTask":
+                  return await updateTask(args.taskId, args.calendarId, args.title, args.dueDate, args.description, args.completed, args.percentComplete, args.priority);
                 case "sendMail":
                   return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
                 case "replyToMessage":
