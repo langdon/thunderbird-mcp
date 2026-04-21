@@ -24,6 +24,11 @@ const MCP_MAX_PORT_ATTEMPTS = 10;
 const _attachTimers = new Set();
 // Track temp files created for inline base64 attachments (cleaned up on shutdown).
 const _tempAttachFiles = new Set();
+// Track compose windows already claimed by an in-flight replyToMessage call,
+// so concurrent replies to the same original message never bind two observers
+// to the same compose window (which would double-inject the body/attachments).
+// WeakSet so entries are collected automatically when the window is destroyed.
+const _claimedReplyComposeWindows = new WeakSet();
 const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
 // Must be large enough to carry MAX_BASE64_SIZE plus JSON-RPC framing overhead.
 // The httpd.sys.mjs pre-buffer cap uses the same value.
@@ -1501,12 +1506,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const OPEN_TIMEOUT_MS = 15000;
                 let settled = false;
                 let matchedWindow = null;
+                let pendingStateListener = null;
+                let pendingStateCompose = null;
 
                 const finish = (result) => {
                   if (settled) return;
                   settled = true;
                   try { Services.ww.unregisterNotification(windowObserver); } catch {}
                   try { timeout.cancel(); } catch {}
+                  // Unregister any dangling state listener so a late
+                  // NotifyComposeBodyReady cannot mutate the compose window
+                  // after we have already resolved (e.g. after a timeout).
+                  if (pendingStateListener && pendingStateCompose) {
+                    try { pendingStateCompose.UnregisterStateListener(pendingStateListener); } catch {}
+                  }
+                  pendingStateListener = null;
+                  pendingStateCompose = null;
                   resolve(result);
                 };
 
@@ -1524,6 +1539,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (!composeWin.gMsgCompose) return;
                     if (composeWin.gMsgCompose.originalMsgURI !== originalMsgURI) return;
                     if (composeWin.gComposeType !== compType) return;
+                    // When two callers reply to the same message concurrently,
+                    // both observers see both compose windows. Skip any window
+                    // that has already been claimed by a prior observer so each
+                    // call binds to exactly one compose window.
+                    if (_claimedReplyComposeWindows.has(composeWin)) return;
+                    _claimedReplyComposeWindows.add(composeWin);
 
                     matchedWindow = composeWin;
                     try { Services.ww.unregisterNotification(windowObserver); } catch {}
@@ -1534,9 +1555,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       ComposeProcessDone() {},
                       SaveInFolderDone() {},
                       NotifyComposeBodyReady() {
+                        // Guard against a late body-ready firing after the
+                        // caller already timed out -- don't mutate the compose
+                        // window once the promise is settled.
+                        if (settled) {
+                          try { composeWin.gMsgCompose.UnregisterStateListener(stateListener); } catch {}
+                          return;
+                        }
+
                         try {
                           composeWin.gMsgCompose.UnregisterStateListener(stateListener);
                         } catch {}
+                        pendingStateListener = null;
+                        pendingStateCompose = null;
 
                         try {
                           applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc);
@@ -1549,6 +1580,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       },
                     };
 
+                    pendingStateListener = stateListener;
+                    pendingStateCompose = composeWin.gMsgCompose;
                     composeWin.gMsgCompose.RegisterStateListener(stateListener);
                   } catch (e) {
                     finish({ error: e.toString() });
@@ -3779,16 +3812,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    return;
 	                  }
 
-	                  let reviewTo = to;
-	                  let reviewCc = cc;
-	                  // Preserve the tool's historical override semantics: once
-	                  // callers provide replyAll To/Cc values, they replace
-	                  // Thunderbird's generated recipient layout instead of
-	                  // augmenting it.
-	                  if (replyAll && (to || cc)) {
-	                    reviewTo = to || msgHdr.author;
-	                    reviewCc = cc || getReplyAllCcRecipients(msgHdr, folder);
-	                  }
+	                  // Pass through only the fields the caller explicitly provided.
+	                  // Any field left undefined is filled in by Thunderbird's native
+	                  // reply/reply-all machinery (including proper Reply-To,
+	                  // Mail-Followup-To, mailing-list handling, and self-filtering
+	                  // against the selected identity). Our old custom
+	                  // getReplyAllCcRecipients path bypassed all of that.
+	                  const reviewTo = to;
+	                  const reviewCc = cc;
 
 	                  if (skipReview) {
 	                    const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
