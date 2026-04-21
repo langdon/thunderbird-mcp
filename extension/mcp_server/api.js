@@ -4653,6 +4653,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (typeof value !== "object" || Array.isArray(value)) {
                     errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
                   }
+                } else if (expectedType === "integer") {
+                  // JSON Schema "integer" is a whole number. typeof reports
+                  // "number" for both integers and floats, so check explicitly.
+                  if (typeof value !== "number" || !Number.isInteger(value)) {
+                    errors.push(`Parameter '${key}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
+                  }
                 } else if (expectedType && typeof value !== expectedType) {
                   errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
                 }
@@ -4685,6 +4691,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (value.trim() === "") continue;
                   const n = Number(value);
                   if (Number.isFinite(n)) args[key] = n;
+                } else if (expected === "integer" && typeof value === "string") {
+                  if (value.trim() === "") continue;
+                  const n = Number(value);
+                  if (Number.isFinite(n) && Number.isInteger(n)) args[key] = n;
                 } else if (expected === "array" && typeof value === "string") {
                   try {
                     const parsed = JSON.parse(value);
