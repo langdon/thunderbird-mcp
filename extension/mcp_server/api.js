@@ -2556,32 +2556,57 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (priority !== undefined) { newItem.priority = priority; changes.push("priority"); }
 
                 if (dueDate !== undefined) {
-                  const js = new Date(dueDate);
-                  if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
-                  if (/^\d{4}-\d{2}-\d{2}$/.test(dueDate.trim())) {
-                    const dt = cal.createDateTime();
-                    dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
-                    dt.isDate = true;
-                    newItem.dueDate = dt;
+                  // Explicit null or empty string clears the due date.
+                  // Without this, `new Date(null).getTime() === 0` would
+                  // silently write Unix epoch (1970-01-01) instead.
+                  if (dueDate === null || dueDate === "") {
+                    newItem.dueDate = null;
                   } else {
-                    newItem.dueDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                    const js = new Date(dueDate);
+                    if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
+                    if (/^\d{4}-\d{2}-\d{2}$/.test(dueDate.trim())) {
+                      const dt = cal.createDateTime();
+                      dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                      dt.isDate = true;
+                      newItem.dueDate = dt;
+                    } else {
+                      newItem.dueDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                    }
                   }
                   changes.push("dueDate");
                 }
 
+                // 'completed' and 'percentComplete' both control completion state.
+                // Reject ambiguous input rather than guessing precedence.
+                if (completed !== undefined && percentComplete !== undefined) {
+                  return { error: "Specify either 'completed' or 'percentComplete', not both" };
+                }
+
+                // Apply completion state keeping STATUS, PERCENT-COMPLETE, and
+                // COMPLETED consistent per iCal RFC 5545 VTODO rules -- so
+                // Thunderbird's UI and other consumers see a valid task state.
+                function applyCompletionState(pct) {
+                  const clamped = Math.min(100, Math.max(0, pct));
+                  newItem.percentComplete = clamped;
+                  if (clamped === 100) {
+                    newItem.setProperty("STATUS", "COMPLETED");
+                    newItem.completedDate = cal.dtz.jsDateToDateTime(new Date(), cal.dtz.defaultTimezone);
+                  } else if (clamped === 0) {
+                    newItem.setProperty("STATUS", "NEEDS-ACTION");
+                    newItem.completedDate = null;
+                  } else {
+                    newItem.setProperty("STATUS", "IN-PROCESS");
+                    newItem.completedDate = null;
+                  }
+                }
+
                 if (percentComplete !== undefined) {
-                  newItem.percentComplete = Math.min(100, Math.max(0, percentComplete));
+                  applyCompletionState(percentComplete);
                   changes.push("percentComplete");
                 }
 
                 if (completed !== undefined) {
-                  if (completed) {
-                    newItem.percentComplete = 100;
-                    newItem.completedDate = cal.dtz.jsDateToDateTime(new Date(), cal.dtz.defaultTimezone);
-                  } else {
-                    newItem.percentComplete = 0;
-                    newItem.completedDate = null;
-                  }
+                  applyCompletionState(completed ? 100 : 0);
                   changes.push("completed");
                 }
 
