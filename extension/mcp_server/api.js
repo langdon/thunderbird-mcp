@@ -39,6 +39,7 @@ const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
+const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
 const VALID_CRUD = ["create", "read", "update", "delete"];
@@ -965,6 +966,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const allowed = getAllowedAccountIds();
               if (allowed.length === 0) return true;
               return allowed.includes(accountKey);
+            }
+
+            /**
+             * Check if the user has disabled the skipReview shortcut.
+             * When true, send/reply/forward tools must open the review window even
+             * if the caller passed skipReview: true.
+             */
+            function isSkipReviewBlocked() {
+              try {
+                return Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, false);
+              } catch {
+                // Fail closed: if we can't read the pref, assume blocked so the
+                // user retains ability to review before send.
+                return true;
+              }
             }
 
             /**
@@ -3753,6 +3769,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview) {
               try {
+                if (skipReview && isSkipReviewBlocked()) {
+                  return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
+                }
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
 
@@ -3818,6 +3837,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview) {
 	              return new Promise((resolve) => {
 	                try {
+	                  if (skipReview && isSkipReviewBlocked()) {
+	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
+	                    return;
+	                  }
 	                  const found = findMessage(messageId, folderPath);
 	                  if (found.error) {
 	                    resolve({ error: found.error });
@@ -3957,6 +3980,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
 	              return new Promise((resolve) => {
 	                try {
+	                  if (skipReview && isSkipReviewBlocked()) {
+	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
+	                    return;
+	                  }
 	                  const found = findMessage(messageId, folderPath);
 	                  if (found.error) {
 	                    resolve({ error: found.error });
@@ -5705,6 +5732,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             mode: allowedAccountIds.length === 0 ? "all" : "restricted",
             allowedAccountIds,
           };
+        },
+
+        getBlockSkipReview: async function() {
+          let blocked = false;
+          try {
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, false);
+          } catch { /* ignore */ }
+          return { blockSkipReview: blocked };
+        },
+
+        setBlockSkipReview: async function(blockSkipReview) {
+          if (typeof blockSkipReview !== "boolean") {
+            return { error: "blockSkipReview must be a boolean" };
+          }
+          if (blockSkipReview) {
+            Services.prefs.setBoolPref(PREF_BLOCK_SKIPREVIEW, true);
+          } else {
+            try { Services.prefs.clearUserPref(PREF_BLOCK_SKIPREVIEW); } catch { /* ignore */ }
+          }
+          return { success: true, blockSkipReview };
         },
       }
     };

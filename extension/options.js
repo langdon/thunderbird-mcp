@@ -254,6 +254,42 @@ saveToolsBtn.addEventListener("click", async () => {
   saveToolsBtn.disabled = false;
 });
 
+const blockSkipReviewCheckbox = document.getElementById("blockSkipReview");
+const saveSkipReviewBtn = document.getElementById("saveSkipReviewBtn");
+const saveSkipReviewStatus = document.getElementById("saveSkipReviewStatus");
+
+async function loadSkipReviewPref() {
+  try {
+    const { blockSkipReview } = await browser.mcpServer.getBlockSkipReview();
+    blockSkipReviewCheckbox.checked = !!blockSkipReview;
+    saveSkipReviewBtn.disabled = false;
+    saveSkipReviewStatus.textContent = "";
+  } catch (e) {
+    saveSkipReviewStatus.textContent = "Error loading setting: " + e.message;
+    saveSkipReviewStatus.className = "save-status error";
+  }
+}
+
+saveSkipReviewBtn.addEventListener("click", async () => {
+  saveSkipReviewBtn.disabled = true;
+  saveSkipReviewStatus.textContent = "Saving...";
+  saveSkipReviewStatus.className = "save-status";
+  try {
+    const result = await browser.mcpServer.setBlockSkipReview(blockSkipReviewCheckbox.checked);
+    if (result.error) {
+      saveSkipReviewStatus.textContent = result.error;
+      saveSkipReviewStatus.className = "save-status error";
+    } else {
+      saveSkipReviewStatus.textContent = "Saved.";
+    }
+  } catch (e) {
+    saveSkipReviewStatus.textContent = "Error: " + e.message;
+    saveSkipReviewStatus.className = "save-status error";
+  }
+  saveSkipReviewBtn.disabled = false;
+});
+
 loadServerInfo();
 loadAccountAccess();
 loadToolAccess();
+loadSkipReviewPref();
