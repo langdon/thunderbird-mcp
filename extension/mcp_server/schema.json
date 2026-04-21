@@ -58,6 +58,26 @@
             "description": "Array of account IDs to allow. Empty array means all accounts."
           }
         ]
+      },
+      {
+        "name": "getBlockSkipReview",
+        "type": "function",
+        "async": true,
+        "description": "Get whether skipReview is blocked by user preference",
+        "parameters": []
+      },
+      {
+        "name": "setBlockSkipReview",
+        "type": "function",
+        "async": true,
+        "description": "Set whether skipReview is blocked by user preference",
+        "parameters": [
+          {
+            "name": "blockSkipReview",
+            "type": "boolean",
+            "description": "When true, send/reply/forward tools reject skipReview=true and require the review window."
+          }
+        ]
       }
     ]
   }
