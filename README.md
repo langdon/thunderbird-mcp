@@ -17,7 +17,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 35 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 36 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Compose tools open a review window before sending by default. Set `skipReview` to send directly when you've already approved the content upstream. **Nothing gets sent without your approval.**
 
@@ -43,7 +43,7 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 |------|-------------|
 | `listAccounts` | List all email accounts and their identities |
 | `listFolders` | Browse folder tree with message counts -- filter by account or subtree |
-| `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Set `searchBody: true` for full-text body search via Thunderbird's Gloda index. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. |
+| `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Multi-word queries are AND-of-tokens (every word must appear somewhere). Prefix with `from:`, `subject:`, `to:`, or `cc:` to restrict to one field. Set `searchBody: true` for full-text body search via Thunderbird's Gloda index. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. |
 | `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Set `rawSource: true` for the complete RFC 2822 source (all headers + MIME parts). Optional attachment saving. Includes inline CID images. |
 | `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
 | `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
@@ -95,12 +95,13 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 | Tool | Description |
 |------|-------------|
 | `listCalendars` | List all calendars with read-only, event, and task support flags |
-| `createEvent` | Create a calendar event -- opens a review dialog, or set `skipReview` to add directly |
-| `listEvents` | Query events by date range with recurring event expansion |
-| `updateEvent` | Modify an event's title, dates, location, or description |
+| `createEvent` | Create a calendar event -- opens a review dialog, or set `skipReview` to add directly. Accepts `status: tentative \| confirmed \| cancelled` (VEVENT STATUS per iCal RFC 5545). |
+| `listEvents` | Query events by date range with recurring event expansion. Returns `status` on each event. |
+| `updateEvent` | Modify an event's title, dates, location, description, or `status` |
 | `deleteEvent` | Delete a calendar event by ID |
 | `createTask` | Open a pre-filled task dialog for review |
 | `listTasks` | List tasks/to-dos from calendars -- filter by completion status, due date, or calendar |
+| `updateTask` | Update a task's title, due date, description, priority, completion status, or percent complete |
 
 ### Access Control
 
@@ -109,6 +110,8 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 | `getAccountAccess` | View which accounts the MCP server can access |
 
 Account and tool access are configured via the extension settings page (Tools > Add-ons > Thunderbird MCP > Options). Access control is not MCP-exposed -- only the user can change it.
+
+The same settings page has a "Send Safety" section: toggle **Block `skipReview`** to reject `sendMail` / `replyToMessage` / `forwardMessage` calls that pass `skipReview: true`. The review-window path still works, so clients stay usable -- they just can't send silently.
 
 ---
 
@@ -231,7 +234,7 @@ thunderbird-mcp/
 │   ├── options.js              # Settings page logic
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 35 MCP tools + auth + access control
+│       ├── api.js              # All 36 MCP tools + auth + access control
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/
