@@ -1498,6 +1498,12 @@ RequestReader.prototype = {
           : 0;
         dumpn("_processHeaders, Content-length=" + this._contentLength);
 
+        // Reject oversized request bodies before buffering into memory.
+        // 10 MB is generous for JSON-RPC MCP requests.
+        if (this._contentLength > 10 * 1024 * 1024) {
+          throw HTTP_413;
+        }
+
         this._state = READER_IN_BODY;
       }
       return done;
@@ -3435,6 +3441,9 @@ ServerHandler.prototype = {
   /**
    * Contains handlers for the default set of URIs contained in this server.
    */
+  // /trace endpoint removed — it echoed all request headers (including
+  // Authorization tokens) without authentication, enabling token leakage
+  // to any local process.
   _defaultPaths: {
     "/": function (metadata, response) {
       response.setStatusLine(metadata.httpVersion, 200, "OK");
@@ -3450,39 +3459,6 @@ ServerHandler.prototype = {
                         files!</p>\
                     </body>\
                   </html>";
-
-      response.bodyOutputStream.write(body, body.length);
-    },
-
-    "/trace": function (metadata, response) {
-      response.setStatusLine(metadata.httpVersion, 200, "OK");
-      response.setHeader("Content-Type", "text/plain;charset=utf-8", false);
-
-      var body =
-        "Request-URI: " +
-        metadata.scheme +
-        "://" +
-        metadata.host +
-        ":" +
-        metadata.port +
-        metadata.path +
-        "\n\n";
-      body += "Request (semantically equivalent, slightly reformatted):\n\n";
-      body += metadata.method + " " + metadata.path;
-
-      if (metadata.queryString) {
-        body += "?" + metadata.queryString;
-      }
-
-      body += " HTTP/" + metadata.httpVersion + "\r\n";
-
-      var headEnum = metadata.headers;
-      while (headEnum.hasMoreElements()) {
-        var fieldName = headEnum
-          .getNext()
-          .QueryInterface(Ci.nsISupportsString).data;
-        body += fieldName + ": " + metadata.getHeader(fieldName) + "\r\n";
-      }
 
       response.bodyOutputStream.write(body, body.length);
     },
