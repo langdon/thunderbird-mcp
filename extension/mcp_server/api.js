@@ -2983,9 +2983,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    try {
 	                      const folder = msgHdr.folder;
 	                      stream = folder.getMsgInputStream(msgHdr, {});
-	                      const messageSize = folder.hasMsgOffline(msgHdr.messageKey)
+	                      let messageSize = folder.hasMsgOffline(msgHdr.messageKey)
 	                        ? msgHdr.offlineMessageSize
 	                        : msgHdr.messageSize;
+	                      // For local folders (mbox), messageSize can be 0 or
+	                      // inaccurate for imported messages. Fall back to reading
+	                      // whatever is available in the stream.
+	                      if (!messageSize || messageSize <= 0) {
+	                        messageSize = stream.available();
+	                      }
+	                      if (!messageSize || messageSize <= 0) {
+	                        resolve({ error: "Message has zero size - cannot read raw source" });
+	                        return;
+	                      }
 	                      // No charset specified -- defaults to Latin-1 which
 	                      // preserves raw bytes. UTF-8 would corrupt messages
 	                      // with 8-bit content.
@@ -3013,10 +3023,143 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return;
                     }
 
-                    const fmt = extractFormattedBody(aMimeMsg, bodyFormat || "markdown");
+                    const requestedBodyFormat = bodyFormat || "markdown";
+                    const fmt = extractFormattedBody(aMimeMsg, requestedBodyFormat);
                     let body = fmt.body;
                     let bodyIsHtml = fmt.bodyIsHtml;
-                    if (!body) body = "(Could not extract body text)";
+                    // If structured MIME extraction failed, try raw stream
+                    // fallback for local mbox folders where MsgHdrToMimeMessage
+                    // returns empty body parts.
+                    if (!body) {
+                      const fallbackContext = `thunderbird-mcp: raw singlepart body fallback (${msgHdr.messageId})`;
+                      let rawStream = null;
+                      try {
+                        const rawFolder = msgHdr.folder;
+                        rawStream = rawFolder.getMsgInputStream(msgHdr, {});
+                        let rawSize = rawFolder.hasMsgOffline(msgHdr.messageKey)
+                          ? msgHdr.offlineMessageSize
+                          : msgHdr.messageSize;
+                        if (!rawSize || rawSize <= 0) rawSize = rawStream.available();
+                        if (!rawSize || rawSize <= 0) {
+                          console.error(`${fallbackContext}: message stream has zero size`);
+                        } else {
+                          // No charset specified -- defaults to Latin-1 which
+                          // preserves raw bytes for later transfer decoding.
+                          const rawContent = NetUtil.readInputStreamToString(rawStream, rawSize);
+                          // Find header/body boundary. Prefer CRLFCRLF (RFC 5322),
+                          // then LFLF (LF-normalized mbox), then CRCR (legacy
+                          // classic Mac exports). Pick the earliest match so a
+                          // stray LFLF inside CRLF-separated headers doesn't win.
+                          const boundaryMatch = rawContent.match(/\r\n\r\n|\n\n|\r\r/);
+                          const headerEnd = boundaryMatch ? boundaryMatch.index : -1;
+                          const bodyStart = boundaryMatch
+                            ? boundaryMatch.index + boundaryMatch[0].length
+                            : -1;
+                          if (bodyStart < 0) {
+                            console.error(`${fallbackContext}: could not find header/body boundary`);
+                          } else {
+                            const headerBlock = rawContent.slice(0, headerEnd);
+                            const rawBody = rawContent.slice(bodyStart);
+                            // Unfold continuation lines for all three line-ending flavors.
+                            const unfoldedHeaders = headerBlock
+                              .replace(/(?:\r\n|\r|\n)[ \t]+/g, " ");
+                            let contentTypeHeader = "";
+                            let transferEncodingHeader = "";
+                            for (const line of unfoldedHeaders.split(/\r\n|\r|\n/)) {
+                              const colonIdx = line.indexOf(":");
+                              if (colonIdx < 0) continue;
+                              const headerName = line.slice(0, colonIdx).trim().toLowerCase();
+                              const headerValue = line.slice(colonIdx + 1).trim();
+                              if (headerName === "content-type" && !contentTypeHeader) {
+                                contentTypeHeader = headerValue;
+                              } else if (headerName === "content-transfer-encoding" && !transferEncodingHeader) {
+                                transferEncodingHeader = headerValue;
+                              }
+                            }
+                            const contentTypeValue = contentTypeHeader || "text/plain";
+                            const contentType = (contentTypeValue.split(";")[0] || "text/plain").trim().toLowerCase();
+                            if (contentType.startsWith("multipart/")) {
+                              console.error(`${fallbackContext}: multipart top-level content-type not supported (${contentType})`);
+                            } else if (contentType !== "text/plain" && contentType !== "text/html") {
+                              console.error(`${fallbackContext}: unsupported top-level content-type "${contentType || "(missing)"}"`);
+                            } else {
+                              const charsetMatch = contentTypeValue.match(/(?:^|;)\s*charset\s*=\s*(?:"([^"]+)"|'([^']+)'|([^;\s]+))/i);
+                              const charset = (charsetMatch?.[1] || charsetMatch?.[2] || charsetMatch?.[3] || "utf-8").trim();
+                              const transferEncoding = ((transferEncodingHeader.split(";")[0] || "7bit").trim().toLowerCase() || "7bit");
+                              let bodyBytes = null;
+
+                              if (transferEncoding === "quoted-printable") {
+                                // Remove quoted-printable soft breaks: =CRLF, =LF, =CR.
+                                const qpBody = rawBody.replace(/=(?:\r\n|\r|\n)/g, "");
+                                const decodedBytes = [];
+                                for (let i = 0; i < qpBody.length; i++) {
+                                  if (qpBody[i] === "=" && i + 2 < qpBody.length) {
+                                    const hex = qpBody.slice(i + 1, i + 3);
+                                    if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
+                                      decodedBytes.push(parseInt(hex, 16));
+                                      i += 2;
+                                      continue;
+                                    }
+                                  }
+                                  decodedBytes.push(qpBody.charCodeAt(i) & 0xFF);
+                                }
+                                bodyBytes = new Uint8Array(decodedBytes);
+                              } else if (transferEncoding === "base64") {
+                                try {
+                                  const binary = atob(rawBody.replace(/\s/g, ""));
+                                  bodyBytes = new Uint8Array(binary.length);
+                                  for (let i = 0; i < binary.length; i++) {
+                                    bodyBytes[i] = binary.charCodeAt(i) & 0xFF;
+                                  }
+                                } catch (e) {
+                                  console.error(`${fallbackContext}: invalid base64 body`, e);
+                                }
+                              } else if (transferEncoding === "7bit" || transferEncoding === "8bit" || transferEncoding === "binary") {
+                                bodyBytes = new Uint8Array(rawBody.length);
+                                for (let i = 0; i < rawBody.length; i++) {
+                                  bodyBytes[i] = rawBody.charCodeAt(i) & 0xFF;
+                                }
+                              } else {
+                                console.error(`${fallbackContext}: unsupported content-transfer-encoding "${transferEncoding}"`);
+                              }
+
+                              if (bodyBytes) {
+                                let decodedBody;
+                                try {
+                                  decodedBody = new TextDecoder(charset, { fatal: false }).decode(bodyBytes);
+                                } catch (e) {
+                                  if (!(e instanceof RangeError) && e?.name !== "RangeError") throw e;
+                                  console.error(`${fallbackContext}: unknown charset "${charset}", retrying with utf-8`);
+                                  decodedBody = new TextDecoder("utf-8", { fatal: false }).decode(bodyBytes);
+                                }
+
+                                if (contentType === "text/html") {
+                                  if (requestedBodyFormat === "html") {
+                                    body = decodedBody;
+                                    bodyIsHtml = true;
+                                  } else if (requestedBodyFormat === "markdown") {
+                                    body = htmlToMarkdown(decodedBody);
+                                    bodyIsHtml = false;
+                                  } else {
+                                    body = stripHtml(decodedBody);
+                                    bodyIsHtml = false;
+                                  }
+                                } else {
+                                  body = decodedBody;
+                                  bodyIsHtml = false;
+                                }
+                              }
+                            }
+                          }
+                        }
+                      } catch (e) {
+                        console.error(`${fallbackContext}: failed`, e);
+                      } finally {
+                        if (rawStream) try { rawStream.close(); } catch (e) {
+                          console.error(`${fallbackContext}: failed to close stream`, e);
+                        }
+                      }
+                    }
 
                     // Always collect attachment metadata
                     const attachments = [];
