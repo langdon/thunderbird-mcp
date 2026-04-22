@@ -10,21 +10,32 @@ XPI_FILE="$DIST_DIR/thunderbird-mcp.xpi"
 
 # Find Thunderbird profile directory
 find_profile() {
-    local flatpak_profiles_dir="$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird"
-    local standard_profiles_dir="$HOME/.thunderbird"
-    local profiles_dir
+    # Native profile is preferred when multiple install types coexist --
+    # vestigial Flatpak profile dirs from prior experiments must not
+    # hijack a native install that is actually in use.
+    local profile_roots=(
+        "$HOME/.thunderbird"
+        "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird"
+        "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird"
+        "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
+    )
+    local profiles_dir=""
+    local profile=""
 
-    if [[ -d "$flatpak_profiles_dir" ]]; then
-        profiles_dir="$flatpak_profiles_dir"
-    elif [[ -d "$standard_profiles_dir" ]]; then
-        profiles_dir="$standard_profiles_dir"
-    else
-        echo "Error: Thunderbird profiles directory not found (checked $flatpak_profiles_dir and $standard_profiles_dir)" >&2
+    for candidate in "${profile_roots[@]}"; do
+        if [[ -d "$candidate" ]]; then
+            profiles_dir="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$profiles_dir" ]]; then
+        echo "Error: Thunderbird profiles directory not found (checked ${profile_roots[*]})" >&2
         exit 1
     fi
 
     # Look for default-release profile first, then any .default profile
-    local profile=$(ls -d "$profiles_dir"/*.default-release 2>/dev/null | head -1)
+    profile=$(ls -d "$profiles_dir"/*.default-release 2>/dev/null | head -1)
     if [[ -z "$profile" ]]; then
         profile=$(ls -d "$profiles_dir"/*.default 2>/dev/null | head -1)
     fi
@@ -52,7 +63,7 @@ echo "Installing to profile: $PROFILE_DIR"
 mkdir -p "$EXTENSIONS_DIR"
 
 # Copy extension
-cp "$XPI_FILE" "$EXTENSIONS_DIR/thunderbird-mcp@luthriel.dev.xpi"
+cp "$XPI_FILE" "$EXTENSIONS_DIR/thunderbird-mcp@tkasperczyk.dev.xpi"
 
 echo "Installed! Restart Thunderbird to activate."
 echo ""
